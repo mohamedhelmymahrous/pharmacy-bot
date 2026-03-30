@@ -11,6 +11,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import pdfplumber
 import io
 import random
+import gc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ ADMIN_CHAT_ID  = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 CLIENTS_FILE   = "clients.json"
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-pro")
+model = genai.GenerativeModel("gemini-1.5-flash")  # flash أخف من pro
 
 def load_clients():
     if os.path.exists(CLIENTS_FILE):
@@ -41,17 +42,41 @@ def is_active(chat_id):
 pending_files   = {}
 pending_answers = {}
 
-def extract_pdf_text(data: bytes) -> str:
+def extract_pdf_text(data: bytes, max_pages=5) -> str:
+    """قرا أول 5 صفحات بس عشان توفر ميموري"""
     text = ""
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for page in pdf.pages:
+        for i, page in enumerate(pdf.pages):
+            if i >= max_pages:
+                break
             t = page.extract_text()
             if t:
                 text += t + "\n"
-    return text
+    del data
+    gc.collect()
+    return text[:3000]  # أقصى 3000 حرف
 
-def excel_to_text(data: bytes, max_rows=300) -> str:
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+def excel_to_text(data: bytes, max_rows=150) -> str:
+    """قرا أول شيت بس وأول 150 صف"""
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    out = []
+    for name in wb.sheetnames[:5]:  # أول 5 شيتات بس
+        ws = wb[name]
+        out.append(f"\n=== شيت: {name} ===")
+        for i, row in enumerate(ws.iter_rows(values_only=True), 1):
+            if i > max_rows:
+                break
+            vals = [str(v) if v is not None else "" for v in row]
+            if any(v.strip() for v in vals):
+                out.append(" | ".join(vals))
+    wb.close()
+    del data
+    gc.collect()
+    return "\n".join(out)[:4000]  # أقصى 4000 حرف
+
+def excel_to_text_full(data: bytes, max_rows=150) -> str:
+    """قرا كل الشيتات للمؤشرات"""
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     out = []
     for name in wb.sheetnames:
         ws = wb[name]
@@ -62,11 +87,16 @@ def excel_to_text(data: bytes, max_rows=300) -> str:
             vals = [str(v) if v is not None else "" for v in row]
             if any(v.strip() for v in vals):
                 out.append(" | ".join(vals))
-    return "\n".join(out)
+    wb.close()
+    del data
+    gc.collect()
+    return "\n".join(out)[:5000]
 
 async def call_gemini(prompt: str) -> str:
     response = await asyncio.to_thread(model.generate_content, prompt)
-    return response.text
+    result = response.text
+    gc.collect()
+    return result
 
 def parse_json_safe(text: str):
     import re
@@ -86,72 +116,71 @@ def parse_json_safe(text: str):
 async def classify_files(files):
     summaries = []
     for ftype, data, fname in files:
-        preview = extract_pdf_text(data)[:600] if ftype == "pdf" else excel_to_text(data, max_rows=10)[:600]
-        summaries.append(f"ملف: {fname} ({ftype})\nمحتوى:\n{preview}\n---")
+        if ftype == "pdf":
+            preview = extract_pdf_text(data, max_pages=2)[:400]
+        else:
+            preview = excel_to_text(data, max_rows=8)[:400]
+        summaries.append(f"ملف: {fname} ({ftype})\n{preview}\n---")
+        gc.collect()
 
-    prompt = f"""صنّف كل ملف في واحدة من الفئات:
-- inventory_prev: شيت جرد سابق (Excel أدوية ورصيد)
-- pdf_incoming: PDF وارد (أدوية واردة)
-- pdf_dispensed: PDF منصرف (أدوية منصرفة)
-- patients_sheet: شيت مرضى (Excel أسماء مرضى)
-- kpi_sheet: شيت مؤشرات سنوي (Excel شيتات كتير)
+    prompt = f"""صنّف كل ملف:
+- inventory_prev: شيت جرد Excel (أدوية ورصيد)
+- pdf_incoming: PDF وارد
+- pdf_dispensed: PDF منصرف
+- patients_sheet: شيت مرضى Excel
+- kpi_sheet: شيت مؤشرات Excel (شيتات كتير)
 
-الملفات:
 {chr(10).join(summaries)}
 
-أرجع JSON فقط:
+JSON فقط:
 [{{"filename": "...", "category": "..."}}, ...]"""
 
     result = await call_gemini(prompt)
     return parse_json_safe(result)
 
 async def build_inventory(prev_data: bytes, incoming_text: str, dispensed_text: str, month: str) -> bytes:
-    prev_text = excel_to_text(prev_data, max_rows=500)
+    prev_text = excel_to_text(prev_data, max_rows=400)
 
-    prompt = f"""أنت صيدلاني خبير. ابني شيت جرد شهر {month}.
+    prompt = f"""صيدلاني خبير. ابني شيت جرد {month}.
 
-شيت الجرد السابق:
-{prev_text[:4000]}
+الجرد السابق (أول 400 صنف):
+{prev_text[:3000]}
 
-بيانات الوارد:
-{incoming_text[:2000]}
+الوارد:
+{incoming_text[:1500]}
 
-بيانات المنصرف:
-{dispensed_text[:2000]}
+المنصرف:
+{dispensed_text[:1500]}
 
-القواعد:
-- رصيد أول الشهر = المتبقي من الشهر السابق
-- الوارد = من ملف الوارد (0 لو مش موجود)
-- المجموع = رصيد أول الشهر + الوارد
-- المنصرف = من ملف المنصرف (0 لو مش موجود)
-- المتبقي = المجموع - المنصرف
-- طابق أسماء الأدوية بذكاء
+رصيد أول الشهر = متبقي سابق
+المجموع = رصيد + وارد
+المتبقي = مجموع - منصرف
+طابق الأسماء بذكاء
 
-أرجع JSON فقط:
-[{{"اسم_الصنف": "...", "رصيد_اول_الشهر": 0, "الوارد": 0, "المجموع": 0, "المنصرف": 0, "المتبقي": 0}}, ...]"""
+JSON فقط:
+[{{"اسم_الصنف":"...","رصيد_اول_الشهر":0,"الوارد":0,"المجموع":0,"المنصرف":0,"المتبقي":0}}]"""
 
     result = await call_gemini(prompt)
     rows = parse_json_safe(result) or []
+    gc.collect()
 
-    wb = openpyxl.Workbook()
+    wb = openpyxl.Workbook(write_only=False)
     ws = wb.active
     ws.title = month
     ws.sheet_view.rightToLeft = True
 
-    headers = ["اسم الصنف", "رصيد أول الشهر", "الوارد", "المجموع", "المنصرف", "المتبقي"]
+    headers = ["اسم الصنف","رصيد أول الشهر","الوارد","المجموع","المنصرف","المتبقي"]
     hdr_fill = PatternFill("solid", fgColor="1B3A6B")
-    hdr_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     bd = Border(*[Side(style="thin", color="CCCCCC")]*4)
 
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col, value=h)
         c.fill = hdr_fill
-        c.font = hdr_font
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border = bd
 
-    ws.row_dimensions[1].height = 30
-    for i, w in enumerate([35,18,12,12,12,12], 1):
+    for i, w in enumerate([30,15,10,10,10,10], 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
     for r, row in enumerate(rows, 2):
@@ -162,48 +191,48 @@ async def build_inventory(prev_data: bytes, incoming_text: str, dispensed_text: 
         for col, val in enumerate(vals, 1):
             c = ws.cell(row=r, column=col, value=val)
             c.fill = rf
-            c.font = Font(name="Arial", size=10)
+            c.font = Font(name="Arial", size=9)
             c.alignment = Alignment(horizontal="center" if col>1 else "right", vertical="center")
             c.border = bd
         if isinstance(vals[5], (int,float)) and vals[5] < 0:
-            ws.cell(row=r, column=6).font = Font(name="Arial", size=10, color="C0392B", bold=True)
+            ws.cell(row=r, column=6).font = Font(name="Arial", size=9, color="C0392B", bold=True)
 
     buf = io.BytesIO()
     wb.save(buf)
+    del rows, wb
+    gc.collect()
     return buf.getvalue()
 
 async def fill_kpi_sheet(kpi_data: bytes, patients_data: bytes, month: str):
-    patients_text = excel_to_text(patients_data, max_rows=300)
+    patients_text = excel_to_text(patients_data, max_rows=200)
 
-    wb_p = openpyxl.load_workbook(io.BytesIO(patients_data), data_only=True)
+    # جيب أسماء المرضى
+    wb_p = openpyxl.load_workbook(io.BytesIO(patients_data), data_only=True, read_only=True)
     ws_p = wb_p.active
     all_patients = []
-    for row in ws_p.iter_rows(min_row=2, values_only=True):
+    for i, row in enumerate(ws_p.iter_rows(min_row=2, values_only=True)):
+        if i >= 200:
+            break
         name = row[0]
         mid  = row[1] if len(row) > 1 else None
         if name and str(name).strip():
             all_patients.append((str(name).strip(), str(mid).strip() if mid else ""))
+    wb_p.close()
+    del patients_data
+    gc.collect()
 
     sample1 = random.sample(all_patients, min(30, len(all_patients)))
     sample2 = random.sample(all_patients, min(30, len(all_patients)))
 
-    stats_prompt = f"""من شيت المرضى ده استخرج الأرقام:
-{patients_text[:3000]}
+    stats_prompt = f"""من شيت المرضى استخرج:
+{patients_text[:2000]}
 
-أرجع JSON فقط:
-{{
-  "total_prescriptions": 0,
-  "ab_prescriptions": 0,
-  "inappropriate_ab": 0,
-  "ab_protocol_adherence": 0,
-  "current_medication_count": 0,
-  "appropriateness_count": 0,
-  "counselling_count": 0,
-  "interventions_count": 0
-}}"""
+JSON فقط:
+{{"total_prescriptions":0,"ab_prescriptions":0,"inappropriate_ab":0,"ab_protocol_adherence":0,"current_medication_count":0,"appropriateness_count":0,"counselling_count":0,"interventions_count":0}}"""
 
     stats_result = await call_gemini(stats_prompt)
     stats = parse_json_safe(stats_result) or {}
+    gc.collect()
 
     total  = stats.get("total_prescriptions", len(all_patients))
     ab     = stats.get("ab_prescriptions", 0)
@@ -223,6 +252,8 @@ async def fill_kpi_sheet(kpi_data: bytes, patients_data: bytes, month: str):
             break
 
     wb_kpi = openpyxl.load_workbook(io.BytesIO(kpi_data))
+    del kpi_data
+    gc.collect()
 
     def write_month(sheet_name, numerator, denominator=None, row_num=3, row_total=4):
         if sheet_name not in wb_kpi.sheetnames:
@@ -259,32 +290,34 @@ async def fill_kpi_sheet(kpi_data: bytes, patients_data: bytes, month: str):
 
     buf = io.BytesIO()
     wb_kpi.save(buf)
+    del wb_kpi
+    gc.collect()
 
-    questions = f"""✅ ملأت اللي أقدر عليه تلقائياً!
+    questions = f"""✅ ملأت اللي أقدر عليه!
 
-محتاج منك الأرقام دي لشهر {month}:
+محتاج أرقام {month}:
 
-1️⃣ التخزين السليم:
-   أدوية الثلاجة / الإجمالي
-   أدوية الضوء / الإجمالي
-   LASA شكل / الإجمالي
-   LASA نطق / الإجمالي
+1️⃣ التخزين:
+ثلاجة / إجمالي
+ضوء / إجمالي
+LASA شكل / إجمالي
+LASA نطق / إجمالي
 
-2️⃣ High Alert & High Concentration:
-   High Alert / الإجمالي
-   High Concentration / الإجمالي
-   مراجعة ثنائية / إجمالي الوصفات
+2️⃣ High Alert & HC:
+HA / إجمالي
+HC / إجمالي
+مراجعة ثنائية / وصفات
 
-3️⃣ الرواكد / الإجمالي
-4️⃣ النواقص / الإجمالي
-5️⃣ كروت التعريف / الإجمالي
-6️⃣ عدد الأخطاء الدوائية
-7️⃣ عدد Near Miss
-8️⃣ عدد الآثار العكسية
-9️⃣ عدد التدخلات الدوائية
-🔟 التوفير بالجنيه
+3️⃣ راكد / إجمالي
+4️⃣ ناقص / إجمالي
+5️⃣ كروت / إجمالي
+6️⃣ أخطاء دوائية
+7️⃣ Near Miss
+8️⃣ آثار عكسية
+9️⃣ تدخلات دوائية
+🔟 توفير بالجنيه
 
-ابعتهم بالترتيب هكذا (مثال):
+مثال:
 12/12 | 20/20 | 15/15 | 8/8 | 16/16 | 1/1 | 117/117 | 0/220 | 9/220 | 195/195 | 3 | 3 | 0 | 0 | 0"""
 
     return buf.getvalue(), questions
@@ -334,6 +367,8 @@ async def complete_kpi(kpi_data: bytes, answers_text: str, month: str) -> bytes:
             break
 
     wb = openpyxl.load_workbook(io.BytesIO(kpi_data))
+    del kpi_data
+    gc.collect()
 
     def w(sheet, row, val):
         if sheet in wb.sheetnames:
@@ -384,6 +419,8 @@ async def complete_kpi(kpi_data: bytes, answers_text: str, month: str) -> bytes:
 
     buf = io.BytesIO()
     wb.save(buf)
+    del wb
+    gc.collect()
     return buf.getvalue()
 
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
@@ -393,7 +430,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # ── ADMIN COMMANDS ──
     if chat_id == ADMIN_CHAT_ID and msg.text:
         text = msg.text.strip()
 
@@ -404,7 +440,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if data.get("name") == name:
                     clients[cid]["active"] = True
                     save_clients(clients)
-                    await context.bot.send_message(int(cid), f"✅ تم تأكيد اشتراكك يا {name}!\nالبوت شغّال معاك 🎉")
+                    await context.bot.send_message(int(cid), f"✅ تم تأكيد اشتراكك يا {name}! 🎉")
                     await msg.reply_text(f"✅ تم تفعيل {name}")
                     return
             await msg.reply_text(f"❌ مش لاقي {name}")
@@ -427,7 +463,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if data.get("name") == name:
                     clients[cid]["active"] = False
                     save_clients(clients)
-                    await context.bot.send_message(int(cid), "⛔ تم إيقاف اشتراكك. للتجديد تواصل مع الإدارة.")
+                    await context.bot.send_message(int(cid), "⛔ تم إيقاف اشتراكك.")
                     await msg.reply_text(f"✅ تم إيقاف {name}")
                     return
 
@@ -444,12 +480,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "عملاء":
             clients = load_clients()
             if not clients:
-                await msg.reply_text("مفيش عملاء لحد دلوقتي.")
+                await msg.reply_text("مفيش عملاء.")
                 return
-            lines = ["📋 قائمة العملاء:\n"]
+            lines = ["📋 العملاء:\n"]
             for cid, data in clients.items():
-                status = "✅ فعّال" if data.get("active") else "⛔ موقوف"
-                lines.append(f"{data.get('name','؟')} — {status} — ID: {cid}")
+                status = "✅" if data.get("active") else "⛔"
+                lines.append(f"{status} {data.get('name','؟')} — {cid}")
             await msg.reply_text("\n".join(lines))
             return
 
@@ -462,11 +498,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_clients(clients)
                 await msg.reply_text(f"✅ تم إضافة {name}")
                 try:
-                    await context.bot.send_message(int(cid), f"أهلاً يا {name}! 👋\nتم تفعيل اشتراكك في بوت الصيدلية.")
+                    await context.bot.send_message(int(cid), f"أهلاً يا {name}! 👋\nتم تفعيل اشتراكك.")
                 except:
                     pass
             else:
-                await msg.reply_text("الصيغة: اضف عميل [الاسم] [chat_id]")
+                await msg.reply_text("الصيغة: اضف عميل [اسم] [id]")
             return
 
         if text == "ابعت فواتير":
@@ -481,13 +517,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     count += 1
                 except:
                     pass
-            await msg.reply_text(f"✅ تم إرسال الفواتير لـ {count} عميل")
+            await msg.reply_text(f"✅ تم الإرسال لـ {count} عميل")
             return
 
         if text == "/start":
             await msg.reply_text(
                 "👨‍💼 لوحة تحكم المدير\n\n"
-                "الأوامر:\n"
                 "• عملاء\n"
                 "• اضف عميل [اسم] [id]\n"
                 "• وقف [اسم]\n"
@@ -498,26 +533,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # ── NOT ACTIVE ──
     if not is_active(chat_id):
         await msg.reply_text("⛔ اشتراكك غير فعّال.\nللاشتراك تواصل مع الإدارة.")
         return
 
     cid_str = str(chat_id)
 
-    # ── PAYMENT PHOTO ──
     if msg.photo and chat_id != ADMIN_CHAT_ID:
         clients = load_clients()
         client_name = clients.get(cid_str, {}).get("name", str(chat_id))
         await msg.reply_text("📨 تم استلام صورة الإيصال، جاري المراجعة...")
         await context.bot.forward_message(ADMIN_CHAT_ID, chat_id, msg.message_id)
         await context.bot.send_message(ADMIN_CHAT_ID,
-            f"💰 {client_name} بعت إيصال دفع\n\n"
-            f"للتأكيد: تأكيد {client_name}\n"
-            f"للرفض: رفض {client_name}")
+            f"💰 {client_name} بعت إيصال\n\n"
+            f"تأكيد {client_name}\n"
+            f"رفض {client_name}")
         return
 
-    # ── DOCUMENTS ──
     if msg.document:
         if cid_str not in pending_files:
             pending_files[cid_str] = []
@@ -531,15 +563,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = bytes(await file_obj.download_as_bytearray())
         pending_files[cid_str].append((ftype, data, fname))
 
-        count = len(pending_files[cid_str])
-        files = pending_files[cid_str]
-
+        count  = len(pending_files[cid_str])
+        files  = pending_files[cid_str]
         pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
         excels = [(t,d,n) for t,d,n in files if t=="excel"]
 
-        # ── الحالة 1: 2 ملفات Excel (مرضى + مؤشرات) بدون PDF ──
+        # الحالة 1: ملفات المرضى والمؤشرات بس (2 Excel بدون PDF)
         if count >= 2 and len(pdfs) == 0 and len(excels) >= 2:
-            await msg.reply_text("✅ استلمت ملفات المرضى والمؤشرات!\nجاري التحليل... ⏳")
+            await msg.reply_text("✅ استلمت الملفات!\nجاري التحليل... ⏳")
             files = pending_files.pop(cid_str)
             excels = [(t,d,n) for t,d,n in files if t=="excel"]
             try:
@@ -547,11 +578,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_map = {}
                 if classifications:
                     for item in classifications:
-                        for ftype2, data2, fname2 in files:
-                            if fname2 == item.get("filename",""):
-                                file_map[item.get("category","")] = (ftype2, data2, fname2)
+                        for ft, fd, fn in files:
+                            if fn == item.get("filename",""):
+                                file_map[item.get("category","")] = (ft, fd, fn)
 
-                patients = file_map.get("patients_sheet", excels[0] if len(excels)>0 else None)
+                patients = file_map.get("patients_sheet", excels[0] if excels else None)
                 kpi      = file_map.get("kpi_sheet",      excels[1] if len(excels)>1 else None)
 
                 if kpi and patients:
@@ -561,15 +592,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pending_answers[cid_str] = {"kpi_data": kpi_partial, "month": month}
                     await context.bot.send_message(chat_id, questions)
                 else:
-                    await context.bot.send_message(chat_id, "❌ مش قادر أحدد الملفات. تأكد إنك بعتت شيت المرضى وشيت المؤشرات.")
+                    await context.bot.send_message(chat_id, "❌ مش قادر أحدد الملفات، جرب تاني.")
             except Exception as e:
                 logger.error(f"Error: {e}")
-                await context.bot.send_message(chat_id, f"❌ حصل خطأ: {str(e)}")
+                await context.bot.send_message(chat_id, f"❌ خطأ: {str(e)}")
+            finally:
+                gc.collect()
             return
 
-        # ── الحالة 2: 3 ملفات (جرد + وارد + منصرف) ──
+        # الحالة 2: ملفات الجرد (Excel + 2 PDF)
         if count >= 3 and len(pdfs) >= 2 and len(excels) >= 1:
-            await msg.reply_text("✅ استلمت ملفات الجرد!\nجاري بناء شيت الجرد... ⏳")
+            await msg.reply_text("✅ استلمت ملفات الجرد!\nجاري البناء... ⏳")
             files = pending_files.pop(cid_str)
             pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
             excels = [(t,d,n) for t,d,n in files if t=="excel"]
@@ -578,17 +611,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_map = {}
                 if classifications:
                     for item in classifications:
-                        for ftype2, data2, fname2 in files:
-                            if fname2 == item.get("filename",""):
-                                file_map[item.get("category","")] = (ftype2, data2, fname2)
+                        for ft, fd, fn in files:
+                            if fn == item.get("filename",""):
+                                file_map[item.get("category","")] = (ft, fd, fn)
 
-                inv_prev = file_map.get("inventory_prev", excels[0] if len(excels)>0 else None)
-                pdf_in   = file_map.get("pdf_incoming",  pdfs[0]   if len(pdfs)>0   else None)
-                pdf_dis  = file_map.get("pdf_dispensed", pdfs[1]   if len(pdfs)>1   else None)
-
-                month = datetime.now().strftime("%B %Y")
+                inv_prev = file_map.get("inventory_prev", excels[0] if excels else None)
+                pdf_in   = file_map.get("pdf_incoming",  pdfs[0] if pdfs else None)
+                pdf_dis  = file_map.get("pdf_dispensed", pdfs[1] if len(pdfs)>1 else None)
 
                 if inv_prev and pdf_in and pdf_dis:
+                    month    = datetime.now().strftime("%B %Y")
                     inc_text = extract_pdf_text(pdf_in[1])
                     dis_text = extract_pdf_text(pdf_dis[1])
                     inv_xlsx = await build_inventory(inv_prev[1], inc_text, dis_text, month)
@@ -599,15 +631,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"✅ شيت جرد {month} جاهز!"
                     )
                 else:
-                    await context.bot.send_message(chat_id, "❌ مش قادر أحدد الملفات. تأكد من الملفات الـ 3.")
+                    await context.bot.send_message(chat_id, "❌ مش قادر أحدد الملفات، جرب تاني.")
             except Exception as e:
                 logger.error(f"Error: {e}")
-                await context.bot.send_message(chat_id, f"❌ حصل خطأ: {str(e)}")
+                await context.bot.send_message(chat_id, f"❌ خطأ: {str(e)}")
+            finally:
+                gc.collect()
             return
 
-        # ── الحالة 3: 5 ملفات (جرد + وارد + منصرف + مرضى + مؤشرات) ──
+        # الحالة 3: كل الملفات الـ 5
         if count >= 5:
-            await msg.reply_text("✅ استلمت كل الملفات!\nجاري التحليل... ⏳\n(هياخد دقيقتين تقريباً)")
+            await msg.reply_text("✅ استلمت كل الملفات!\nجاري التحليل... ⏳\n(3-4 دقائق)")
             files = pending_files.pop(cid_str)
             pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
             excels = [(t,d,n) for t,d,n in files if t=="excel"]
@@ -616,13 +650,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 file_map = {}
                 if classifications:
                     for item in classifications:
-                        for ftype2, data2, fname2 in files:
-                            if fname2 == item.get("filename",""):
-                                file_map[item.get("category","")] = (ftype2, data2, fname2)
+                        for ft, fd, fn in files:
+                            if fn == item.get("filename",""):
+                                file_map[item.get("category","")] = (ft, fd, fn)
 
-                inv_prev = file_map.get("inventory_prev", excels[0] if len(excels)>0 else None)
-                pdf_in   = file_map.get("pdf_incoming",  pdfs[0]   if len(pdfs)>0   else None)
-                pdf_dis  = file_map.get("pdf_dispensed", pdfs[1]   if len(pdfs)>1   else None)
+                inv_prev = file_map.get("inventory_prev", excels[0] if excels else None)
+                pdf_in   = file_map.get("pdf_incoming",  pdfs[0] if pdfs else None)
+                pdf_dis  = file_map.get("pdf_dispensed", pdfs[1] if len(pdfs)>1 else None)
                 patients = file_map.get("patients_sheet",excels[1] if len(excels)>1 else None)
                 kpi      = file_map.get("kpi_sheet",     excels[2] if len(excels)>2 else None)
 
@@ -637,8 +671,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         document=io.BytesIO(inv_xlsx),
                         filename=f"جرد_{month}.xlsx",
-                        caption=f"✅ شيت جرد {month} جاهز!"
+                        caption="✅ شيت الجرد جاهز!"
                     )
+                    gc.collect()
 
                 if kpi and patients:
                     await context.bot.send_message(chat_id, "📋 بنملأ شيت المؤشرات...")
@@ -648,20 +683,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             except Exception as e:
                 logger.error(f"Error: {e}")
-                await context.bot.send_message(chat_id, f"❌ حصل خطأ: {str(e)}\nجرب تبعت الملفات تاني.")
+                await context.bot.send_message(chat_id, f"❌ خطأ: {str(e)}")
+            finally:
+                gc.collect()
             return
 
-        # لسه مستني ملفات
         await msg.reply_text(
-            f"📎 استلمت {count} ملف...\n\n"
-            f"ابعتلي:\n"
-            f"• 3 ملفات للجرد بس (جرد + وارد PDF + منصرف PDF)\n"
-            f"• 2 ملفات للمؤشرات بس (مرضى + مؤشرات)\n"
-            f"• 5 ملفات للاتنين مع بعض"
+            f"📎 استلمت {count} ملف\n\n"
+            f"للجرد: ابعت Excel + PDF وارد + PDF منصرف\n"
+            f"للمؤشرات: ابعت Excel مرضى + Excel مؤشرات\n"
+            f"للاتنين: ابعت الـ 5 مع بعض"
         )
         return
 
-    # ── TEXT ──
     if msg.text:
         text = msg.text.strip()
 
@@ -675,11 +709,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     document=io.BytesIO(kpi_complete),
                     filename=f"مؤشرات_{month}.xlsx",
-                    caption=f"✅ شيت مؤشرات {month} مكتمل! جاهز للرفع 🎉"
+                    caption=f"✅ مؤشرات {month} مكتملة! 🎉"
                 )
             except Exception as e:
                 logger.error(f"KPI error: {e}")
                 await msg.reply_text(f"❌ خطأ: {str(e)}")
+            finally:
+                gc.collect()
             return
 
         if text == "/start":
@@ -689,20 +725,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_clients(clients)
                 await context.bot.send_message(ADMIN_CHAT_ID,
                     f"🆕 مستخدم جديد!\nID: {chat_id}\n\nللتفعيل: اضف عميل [الاسم] {chat_id}")
-            await msg.reply_text("أهلاً! 👋\nطلبك اتبعت للإدارة.\nهيتواصلوا معاك قريباً.")
+            await msg.reply_text("أهلاً! 👋\nطلبك اتبعت للإدارة.")
             return
 
         await msg.reply_text(
             "📎 ابعتلي الملفات:\n\n"
-            "للجرد بس (3 ملفات):\n"
-            "1️⃣ شيت الجرد السابق (Excel)\n"
+            "للجرد (3 ملفات):\n"
+            "1️⃣ شيت الجرد السابق\n"
             "2️⃣ PDF الوارد\n"
             "3️⃣ PDF المنصرف\n\n"
-            "للمؤشرات بس (2 ملفات):\n"
-            "1️⃣ شيت بيانات المرضى (Excel)\n"
-            "2️⃣ شيت المؤشرات السنوي (Excel)\n\n"
-            "للاتنين مع بعض (5 ملفات):\n"
-            "ابعت الـ 5 مع بعض"
+            "للمؤشرات (2 ملفات):\n"
+            "1️⃣ شيت المرضى\n"
+            "2️⃣ شيت المؤشرات\n\n"
+            "للاتنين (5 ملفات)"
         )
 
 def main():
