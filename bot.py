@@ -55,7 +55,206 @@ def extract_pdf_text(data: bytes, max_pages=5) -> str:
     del data
     gc.collect()
     return text[:3000]  # أقصى 3000 حرف
+def extract_stock_pdf(data: bytes) -> tuple[list[dict], str]:
+    """
+    استخرج بيانات جرد من PDF تقرير Stock Balance.
+    بيرجع: (rows, sheet_name)
+    """
+    import re
 
+    # ماپينج أسماء الأعمدة المحتملة → اسم موحد
+    COL_MAP = {
+        "item code": "code", "code": "code", "item no": "code", "no": "code",
+        "item name": "name", "name": "name", "description": "name", "item": "name",
+        "الصنف": "name", "اسم الصنف": "name", "البيان": "name",
+        "unit": "unit", "uom": "unit", "الوحدة": "unit",
+        "opening": "bfw", "opening balance": "bfw", "balance forward": "bfw",
+        "bfw": "bfw", "رصيد أول الشهر": "bfw", "الرصيد السابق": "bfw",
+        "receipt": "receipt", "received": "receipt", "in": "receipt",
+        "qty in": "receipt", "الوارد": "receipt", "وارد": "receipt",
+        "issue": "issue", "issued": "issue", "out": "issue",
+        "consumption": "issue", "qty out": "issue",
+        "المنصرف": "issue", "منصرف": "issue", "الصادر": "issue",
+    }
+
+    def clean_num(val) -> float:
+        if val is None:
+            return 0.0
+        s = re.sub(r"[^\d.\-]", "", str(val).replace(",", ""))
+        try:
+            return float(s) if s else 0.0
+        except:
+            return 0.0
+
+    def map_headers(raw_headers: list) -> dict:
+        """بيرجع {col_index: canonical_name}"""
+        mapping = {}
+        for i, h in enumerate(raw_headers):
+            if h is None:
+                continue
+            key = str(h).strip().lower()
+            if key in COL_MAP:
+                canonical = COL_MAP[key]
+                if canonical not in mapping.values():  # أول تطابق بس
+                    mapping[i] = canonical
+        return mapping
+
+    def extract_month_year(pdf) -> str:
+        """حاول تستخرج الشهر والسنة من أول صفحة"""
+        months_en = {
+            "january": "يناير", "february": "فبراير", "march": "مارس",
+            "april": "ابريل", "may": "مايو", "june": "يونيو",
+            "july": "يوليو", "august": "اغسطس", "september": "سبتمبر",
+            "october": "اكتوبر", "november": "نوفمبر", "december": "ديسمبر"
+        }
+        months_ar = {
+            "يناير": "يناير", "فبراير": "فبراير", "مارس": "مارس",
+            "ابريل": "ابريل", "مايو": "مايو", "يونيو": "يونيو",
+            "يوليو": "يوليو", "اغسطس": "اغسطس", "سبتمبر": "سبتمبر",
+            "اكتوبر": "اكتوبر", "نوفمبر": "نوفمبر", "ديسمبر": "ديسمبر"
+        }
+        try:
+            page0 = pdf.pages[0]
+            text = page0.extract_text() or ""
+            # دور على سنة
+            year_m = re.search(r"\b(20\d{2})\b", text)
+            year = year_m.group(1) if year_m else datetime.now().strftime("%Y")
+            # دور على شهر إنجليزي
+            for eng, ar in months_en.items():
+                if eng in text.lower():
+                    return f"{ar} {year}"
+            # دور على شهر عربي
+            for ar_key, ar_val in months_ar.items():
+                if ar_key in text:
+                    return f"{ar_val} {year}"
+        except:
+            pass
+        return datetime.now().strftime("%B %Y")
+
+    rows_out = []
+    sheet_name = "جرد"
+    col_mapping = {}
+    headers_found = False
+
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        sheet_name = "منصرف شهر " + extract_month_year(pdf)
+
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            if not tables:
+                continue
+
+            for table in tables:
+                if not table:
+                    continue
+
+                for row_idx, row in enumerate(table):
+                    # تجاهل صفوف فاضية
+                    if not any(c for c in row if c and str(c).strip()):
+                        continue
+
+                    # لو لسه ما لاقيناش الهيدر
+                    if not headers_found:
+                        test_map = map_headers(row)
+                        # محتاجين على الأقل اسم + رقم واحد
+                        has_name = "name" in test_map.values()
+                        has_num  = any(v in test_map.values() for v in ("bfw", "receipt", "issue"))
+                        if has_name and has_num:
+                            col_mapping = test_map
+                            headers_found = True
+                        continue
+
+                    # استخرج البيانات
+                    inv = {v: None for v in ("code", "name", "unit", "bfw", "receipt", "issue")}
+                    for col_i, canonical in col_mapping.items():
+                        if col_i < len(row):
+                            inv[canonical] = row[col_i]
+
+                    name_val = str(inv["name"]).strip() if inv["name"] else ""
+                    if not name_val or name_val.lower() in ("none", ""):
+                        continue
+
+                    bfw     = clean_num(inv["bfw"])
+                    receipt = clean_num(inv["receipt"])
+                    issue   = clean_num(inv["issue"])
+                    closing = bfw + receipt - issue
+
+                    rows_out.append({
+                        "كود الصنف":        str(inv["code"]).strip() if inv["code"] else "",
+                        "اسم الصنف":        name_val,
+                        "الوحدة":           str(inv["unit"]).strip() if inv["unit"] else "",
+                        "رصيد أول الشهر":  bfw,
+                        "الوارد":           receipt,
+                        "المنصرف":          issue,
+                        "الرصيد الختامي":  closing,
+                        "_bfw": bfw, "_receipt": receipt, "_issue": issue, "_closing": closing
+                    })
+
+    # Validation
+    for r in rows_out:
+        expected = r["_bfw"] + r["_receipt"] - r["_issue"]
+        if abs(expected - r["_closing"]) > 0.01:
+            logger.warning(f"KPI mismatch: {r['اسم الصنف']} | {r['_bfw']}+{r['_receipt']}-{r['_issue']} ≠ {r['_closing']}")
+
+    del data
+    gc.collect()
+    return rows_out, sheet_name
+
+
+def build_stock_excel(rows: list[dict], sheet_name: str) -> bytes:
+    """بيبني Excel بنفس فورمات البوت الموجود"""
+    wb = openpyxl.Workbook(write_only=False)
+    ws = wb.active
+    ws.title = sheet_name[:31]  # Excel بيقبل 31 حرف بس
+    ws.sheet_view.rightToLeft = True
+
+    headers = ["كود الصنف", "اسم الصنف", "الوحدة",
+               "رصيد أول الشهر", "الوارد", "المنصرف", "الرصيد الختامي"]
+    col_widths = [15, 35, 10, 18, 12, 12, 16]
+
+    hdr_fill = PatternFill("solid", fgColor="1B3A6B")
+    bd = Border(*[Side(style="thin", color="CCCCCC")] * 4)
+
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.fill = hdr_fill
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = bd
+
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+    for r_idx, row in enumerate(rows, 2):
+        rf = PatternFill("solid", fgColor="F8F9FA" if r_idx % 2 == 0 else "FFFFFF")
+        vals = [
+            row.get("كود الصنف", ""),
+            row.get("اسم الصنف", ""),
+            row.get("الوحدة", ""),
+            row.get("رصيد أول الشهر", 0),
+            row.get("الوارد", 0),
+            row.get("المنصرف", 0),
+            row.get("الرصيد الختامي", 0),
+        ]
+        for col, val in enumerate(vals, 1):
+            c = ws.cell(row=r_idx, column=col, value=val)
+            c.fill = rf
+            c.font = Font(name="Arial", size=9)
+            c.alignment = Alignment(
+                horizontal="center" if col != 2 else "right",
+                vertical="center"
+            )
+            c.border = bd
+        # رصيد سالب → أحمر
+        closing_val = vals[6]
+        if isinstance(closing_val, (int, float)) and closing_val < 0:
+            ws.cell(row=r_idx, column=7).font = Font(name="Arial", size=9, color="C0392B", bold=True)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    del wb, rows
+    gc.collect()
+    return buf.getvalue()
 def excel_to_text(data: bytes, max_rows=150) -> str:
     """قرا أول شيت بس وأول 150 صف"""
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
@@ -127,6 +326,7 @@ async def classify_files(files):
 - inventory_prev: شيت جرد Excel (أدوية ورصيد)
 - pdf_incoming: PDF وارد
 - pdf_dispensed: PDF منصرف
+- pdf_stock_balance: PDF تقرير رصيد مخزون (Stock Balance Report, يحتوي جدول بأعمدة opening/receipt/issue)
 - patients_sheet: شيت مرضى Excel
 - kpi_sheet: شيت مؤشرات Excel (شيتات كتير)
 
@@ -599,7 +799,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 gc.collect()
             return
-
+# الحالة الجديدة: PDF Stock Balance وحده
+    if count == 1 and len(pdfs) == 1:
+        fname_lower = pdfs[0][2].lower()
+        # كشف تلقائي: لو اسم الملف يحتوي على كلمات دالة
+        stock_keywords = ["stock", "balance", "جرد", "رصيد", "inventory", "report"]
+        is_stock = any(kw in fname_lower for kw in stock_keywords)
+        if is_stock:
+            await msg.reply_text("📊 تم التعرف على تقرير الرصيد...\nجاري المعالجة ⏳")
+            files = pending_files.pop(cid_str)
+            try:
+                rows, sheet_name = extract_stock_pdf(files[0][1])
+                if not rows:
+                    await context.bot.send_message(chat_id, "❌ مش قادر أستخرج بيانات من الـ PDF، تأكد من وجود جدول بأعمدة الرصيد.")
+                    return
+                xlsx_data = build_stock_excel(rows, sheet_name)
+                safe_name = sheet_name.replace(" ", "_")
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(xlsx_data),
+                    filename=f"{safe_name}.xlsx",
+                    caption=f"✅ {sheet_name} جاهز!\n📦 {len(rows)} صنف"
+                )
+            except Exception as e:
+                logger.error(f"Stock PDF error: {e}")
+                await context.bot.send_message(chat_id, f"❌ خطأ في معالجة الـ PDF: {str(e)}")
+            finally:
+                gc.collect()
+            return
+        
         # الحالة 2: ملفات الجرد (Excel + 2 PDF)
         if count >= 3 and len(pdfs) >= 2 and len(excels) >= 1:
             await msg.reply_text("✅ استلمت ملفات الجرد!\nجاري البناء... ⏳")
