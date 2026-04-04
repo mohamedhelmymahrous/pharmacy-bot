@@ -184,8 +184,6 @@ def extract_stock_pdf(data: bytes) -> tuple:
         if abs(expected - r["_closing"]) > 0.01:
             logger.warning(f"mismatch: {r['اسم الصنف']}")
 
-    del data
-    gc.collect()
 del data
     gc.collect()
     return rows_out, sheet_name
