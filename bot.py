@@ -22,7 +22,7 @@ ADMIN_CHAT_ID  = int(os.environ.get("ADMIN_CHAT_ID", "0"))
 CLIENTS_FILE   = "clients.json"
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")  # flash أخف من pro
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 def load_clients():
     if os.path.exists(CLIENTS_FILE):
@@ -43,7 +43,6 @@ pending_files   = {}
 pending_answers = {}
 
 def extract_pdf_text(data: bytes, max_pages=5) -> str:
-    """قرا أول 5 صفحات بس عشان توفر ميموري"""
     text = ""
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         for i, page in enumerate(pdf.pages):
@@ -54,7 +53,9 @@ def extract_pdf_text(data: bytes, max_pages=5) -> str:
                 text += t + "\n"
     del data
     gc.collect()
-    return text[:3000]  # أقصى 3000 حرف
+    return text[:3000]
+
+
 def extract_stock_pdf(data: bytes) -> tuple:
     import re
 
@@ -85,65 +86,47 @@ def extract_stock_pdf(data: bytes) -> tuple:
             pass
         return datetime.now().strftime("%B %Y")
 
-    # كود الصنف بيبدأ بـ 3 أرقام - شرطة - 5 أرقام
     CODE_PATTERN = re.compile(r'^(\d{3}-\d{5})$')
-    # سطر أرقام خالص: فيه على الأقل 4 أرقام
-    NUM_PATTERN  = re.compile(r'^[\d\s\.\*]+$')
 
-    rows_out  = []
+    rows_out = []
     sheet_name = "جرد"
 
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         sheet_name = "منصرف شهر " + extract_month_year(pdf)
 
         for page in pdf.pages:
-            # استخدم extract_words عشان تجيب الكلمات بمواضعها
             words = page.extract_words(x_tolerance=5, y_tolerance=5)
             if not words:
                 continue
 
-            # رتّب الكلمات في أسطر بناءً على top (y position)
             lines = {}
             for w in words:
-                y = round(w['top'] / 5) * 5  # قرّب لأقرب 5
+                y = round(w['top'] / 5) * 5
                 lines.setdefault(y, []).append(w)
 
-            # رتّب كل سطر من شمال لأيمن (x)
             sorted_ys = sorted(lines.keys())
             line_texts = []
             for y in sorted_ys:
                 row_words = sorted(lines[y], key=lambda w: w['x0'])
                 line_texts.append([w['text'] for w in row_words])
 
-            # ابحث عن pattern:
-            # سطر فيه كود الصنف (xxx-xxxxx)
-            # بعده سطور فيها الاسم
-            # بعده سطر فيه الأرقام الأربعة: BFW, Receipt, Issue, Balance
             i = 0
             while i < len(line_texts):
                 line = line_texts[i]
 
-                # هل في الكلام ده كود صنف؟
                 codes_in_line = [w for w in line if CODE_PATTERN.match(w)]
                 if not codes_in_line:
                     i += 1
                     continue
 
                 item_code = codes_in_line[0]
-
-                # الاسم: الكلمات في نفس السطر بعد الكود
                 code_idx = line.index(item_code)
                 name_words = line[code_idx+1:]
                 item_name = " ".join(name_words)
 
-                # دور على سطر الأرقام اللي بعده مباشرة
-                # بيكون فيه: BFW_qty، Receipt_qty، Issue_qty، Balance_qty
-                # الـ PDF فيه لكل عمود: Qty | Unit Cost | Amount
-                # يعني 4 × 3 = 12 رقم — إحنا محتاجين الـ qty بس (1، 4، 7، 10)
                 nums_found = False
                 for j in range(i+1, min(i+10, len(line_texts))):
                     nums_line = line_texts[j]
-                    # فلتر: لازم الأرقام تكون ≥ 8 عشان تغطي كل الأعمدة
                     all_nums = []
                     for w in nums_line:
                         w_clean = w.replace(",", "").replace("*", "")
@@ -151,8 +134,6 @@ def extract_stock_pdf(data: bytes) -> tuple:
                             all_nums.append(float(w_clean))
 
                     if len(all_nums) >= 8:
-                        # الـ PDF بيرتب: BFW(qty, ucost, amt) | Receipt(qty,ucost,amt) | Issue(qty,ucost,amt) | Balance(qty,ucost,amt)
-                        # يعني الـ qty هي: index 0, 3, 6, 9
                         try:
                             bfw     = all_nums[0]
                             receipt = all_nums[3]
@@ -184,7 +165,7 @@ def extract_stock_pdf(data: bytes) -> tuple:
         if abs(expected - r["_closing"]) > 0.01:
             logger.warning(f"mismatch: {r['اسم الصنف']}")
 
-del data
+    del data
     gc.collect()
     return rows_out, sheet_name
 
@@ -234,11 +215,12 @@ def build_stock_excel(rows, sheet_name):
     del wb, rows
     gc.collect()
     return buf.getvalue()
+
+
 def excel_to_text(data: bytes, max_rows=150) -> str:
-    """قرا أول شيت بس وأول 150 صف"""
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     out = []
-    for name in wb.sheetnames[:5]:  # أول 5 شيتات بس
+    for name in wb.sheetnames[:5]:
         ws = wb[name]
         out.append(f"\n=== شيت: {name} ===")
         for i, row in enumerate(ws.iter_rows(values_only=True), 1):
@@ -250,10 +232,9 @@ def excel_to_text(data: bytes, max_rows=150) -> str:
     wb.close()
     del data
     gc.collect()
-    return "\n".join(out)[:4000]  # أقصى 4000 حرف
+    return "\n".join(out)[:4000]
 
 def excel_to_text_full(data: bytes, max_rows=150) -> str:
-    """قرا كل الشيتات للمؤشرات"""
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     out = []
     for name in wb.sheetnames:
@@ -385,7 +366,6 @@ JSON فقط:
 async def fill_kpi_sheet(kpi_data: bytes, patients_data: bytes, month: str):
     patients_text = excel_to_text(patients_data, max_rows=200)
 
-    # جيب أسماء المرضى
     wb_p = openpyxl.load_workbook(io.BytesIO(patients_data), data_only=True, read_only=True)
     ws_p = wb_p.active
     all_patients = []
@@ -417,7 +397,7 @@ JSON فقط:
     ab     = stats.get("ab_prescriptions", 0)
     inapp  = stats.get("inappropriate_ab", 0)
     proto  = stats.get("ab_protocol_adherence", ab)
-    curmed = stats.get("current_medication_count", total)
+    curmd  = stats.get("current_medication_count", total)
     appr   = stats.get("appropriateness_count", total)
     couns  = stats.get("counselling_count", total)
     interv = stats.get("interventions_count", 0)
@@ -445,7 +425,7 @@ JSON فقط:
     write_month("AB orders",             ab,    total)
     write_month("AB inappropriate use",  inapp, ab)
     write_month("AB protocols adherence",proto, ab)
-    write_month("current medication",    curmed,total)
+    write_month("current medication",    curmd, total)
     write_month("appropriatness ",       appr,  total)
     write_month("councelling",           couns, total)
     write_month("cost savings",          interv)
@@ -587,7 +567,7 @@ async def complete_kpi(kpi_data: bytes, answers_text: str, month: str) -> bytes:
         ws.cell(row=3, column=month_col, value=cards_ok)
         ws.cell(row=4, column=month_col, value=cards_tot)
 
-    w("medication error",  3, errors)
+    w("medication error", 3, errors)
     if "near miss" in wb.sheetnames:
         wb["near miss"].cell(row=3, column=month_col, value=near_miss)
         wb["near miss"].cell(row=4, column=month_col, value=errors)
@@ -601,6 +581,7 @@ async def complete_kpi(kpi_data: bytes, answers_text: str, month: str) -> bytes:
     del wb
     gc.collect()
     return buf.getvalue()
+
 
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -746,7 +727,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files  = pending_files[cid_str]
         pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
         excels = [(t,d,n) for t,d,n in files if t=="excel"]
-# الحالة 1: ملفات المرضى والمؤشرات بس (2 Excel بدون PDF)
+
+        # الحالة 1: ملفات المرضى والمؤشرات بس (2 Excel بدون PDF)
         if count >= 2 and len(pdfs) == 0 and len(excels) >= 2:
             await msg.reply_text("✅ استلمت الملفات!\nجاري التحليل... ⏳")
             files = pending_files.pop(cid_str)
@@ -901,9 +883,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"للاتنين: ابعت الـ 5 مع بعض"
         )
         return
-
-
-
 
     if msg.text:
         text = msg.text.strip()
