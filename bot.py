@@ -186,7 +186,9 @@ def extract_stock_pdf(data: bytes) -> tuple:
 
     del data
     gc.collect()
-return rows_out, sheet_name
+del data
+    gc.collect()
+    return rows_out, sheet_name
 
 
 def build_stock_excel(rows, sheet_name):
