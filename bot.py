@@ -85,77 +85,100 @@ def extract_stock_pdf(data: bytes) -> tuple:
             pass
         return datetime.now().strftime("%B %Y")
 
-    rows_out = []
+    # كود الصنف بيبدأ بـ 3 أرقام - شرطة - 5 أرقام
+    CODE_PATTERN = re.compile(r'^(\d{3}-\d{5})$')
+    # سطر أرقام خالص: فيه على الأقل 4 أرقام
+    NUM_PATTERN  = re.compile(r'^[\d\s\.\*]+$')
+
+    rows_out  = []
+    sheet_name = "جرد"
 
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         sheet_name = "منصرف شهر " + extract_month_year(pdf)
 
         for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
+            # استخدم extract_words عشان تجيب الكلمات بمواضعها
+            words = page.extract_words(x_tolerance=5, y_tolerance=5)
+            if not words:
                 continue
 
-            lines = text.split("\n")
+            # رتّب الكلمات في أسطر بناءً على top (y position)
+            lines = {}
+            for w in words:
+                y = round(w['top'] / 5) * 5  # قرّب لأقرب 5
+                lines.setdefault(y, []).append(w)
+
+            # رتّب كل سطر من شمال لأيمن (x)
+            sorted_ys = sorted(lines.keys())
+            line_texts = []
+            for y in sorted_ys:
+                row_words = sorted(lines[y], key=lambda w: w['x0'])
+                line_texts.append([w['text'] for w in row_words])
+
+            # ابحث عن pattern:
+            # سطر فيه كود الصنف (xxx-xxxxx)
+            # بعده سطور فيها الاسم
+            # بعده سطر فيه الأرقام الأربعة: BFW, Receipt, Issue, Balance
             i = 0
-            while i < len(lines):
-                line = lines[i].strip()
+            while i < len(line_texts):
+                line = line_texts[i]
 
-                # كود الصنف بيبدأ بـ 200- أو 270- أو 220- إلخ
-                code_match = re.match(r'^(\d{3}-\d{5})\s+(.+)$', line)
-                if code_match:
-                    item_code = code_match.group(1)
-                    item_name = code_match.group(2).strip()
+                # هل في الكلام ده كود صنف؟
+                codes_in_line = [w for w in line if CODE_PATTERN.match(w)]
+                if not codes_in_line:
+                    i += 1
+                    continue
 
-                    # جمّع باقي اسم الصنف من السطور اللي بعده
-                    j = i + 1
-                    while j < len(lines):
-                        next_line = lines[j].strip()
-                        # لو السطر التالي كود تاني أو أرقام — وقف
-                        if re.match(r'^\d{3}-\d{5}', next_line):
-                            break
-                        if re.match(r'^[\d\s\.]+$', next_line) and len(next_line) > 5:
-                            break
-                        # لو فيه نص — ضيفه للاسم
-                        if next_line and not re.match(r'^[\d\.]+$', next_line):
-                            item_name += " " + next_line
-                        j += 1
+                item_code = codes_in_line[0]
 
-                    # دور على السطر اللي فيه الأرقام (BFW, Receipt, Issue, Balance)
-                    nums_line = ""
-                    for k in range(i + 1, min(i + 8, len(lines))):
-                        candidate = lines[k].strip()
-                        nums = re.findall(r'\b\d+\b', candidate)
-                        if len(nums) >= 4:
-                            nums_line = candidate
-                            i = k
-                            break
+                # الاسم: الكلمات في نفس السطر بعد الكود
+                code_idx = line.index(item_code)
+                name_words = line[code_idx+1:]
+                item_name = " ".join(name_words)
 
-                    if nums_line:
-                        all_nums = re.findall(r'\b(\d+)\b', nums_line)
-                        if len(all_nums) >= 4:
-                            # الترتيب: BFW_qty ... Receipt_qty ... Issue_qty ... Balance_qty
-                            # بناءً على الـ PDF: آخر 4 أرقام كبيرة هي الـ qty للأربع أعمدة
-                            bfw     = clean_num(all_nums[-4])
-                            receipt = clean_num(all_nums[-3])
-                            issue   = clean_num(all_nums[-2])
-                            balance = clean_num(all_nums[-1])
+                # دور على سطر الأرقام اللي بعده مباشرة
+                # بيكون فيه: BFW_qty، Receipt_qty، Issue_qty، Balance_qty
+                # الـ PDF فيه لكل عمود: Qty | Unit Cost | Amount
+                # يعني 4 × 3 = 12 رقم — إحنا محتاجين الـ qty بس (1، 4، 7، 10)
+                nums_found = False
+                for j in range(i+1, min(i+10, len(line_texts))):
+                    nums_line = line_texts[j]
+                    # فلتر: لازم الأرقام تكون ≥ 8 عشان تغطي كل الأعمدة
+                    all_nums = []
+                    for w in nums_line:
+                        w_clean = w.replace(",", "").replace("*", "")
+                        if re.match(r'^\d+(\.\d+)?$', w_clean):
+                            all_nums.append(float(w_clean))
+
+                    if len(all_nums) >= 8:
+                        # الـ PDF بيرتب: BFW(qty, ucost, amt) | Receipt(qty,ucost,amt) | Issue(qty,ucost,amt) | Balance(qty,ucost,amt)
+                        # يعني الـ qty هي: index 0, 3, 6, 9
+                        try:
+                            bfw     = all_nums[0]
+                            receipt = all_nums[3]
+                            issue   = all_nums[6]
                             closing = bfw + receipt - issue
 
-                            rows_out.append({
-                                "كود الصنف":       item_code,
-                                "اسم الصنف":       item_name.strip(),
-                                "الوحدة":          "",
-                                "رصيد أول الشهر": bfw,
-                                "الوارد":          receipt,
-                                "المنصرف":         issue,
-                                "الرصيد الختامي": closing,
-                                "_bfw": bfw, "_receipt": receipt,
-                                "_issue": issue, "_closing": closing
-                            })
-
+                            if item_name.strip():
+                                rows_out.append({
+                                    "كود الصنف":       item_code,
+                                    "اسم الصنف":       item_name.strip(),
+                                    "الوحدة":          "",
+                                    "رصيد أول الشهر": bfw,
+                                    "الوارد":          receipt,
+                                    "المنصرف":         issue,
+                                    "الرصيد الختامي": closing,
+                                    "_bfw": bfw, "_receipt": receipt,
+                                    "_issue": issue, "_closing": closing
+                                })
+                                nums_found = True
+                        except:
+                            pass
+                        if nums_found:
+                            i = j
+                            break
                 i += 1
 
-    # Validation
     for r in rows_out:
         expected = r["_bfw"] + r["_receipt"] - r["_issue"]
         if abs(expected - r["_closing"]) > 0.01:
@@ -164,60 +187,6 @@ def extract_stock_pdf(data: bytes) -> tuple:
     del data
     gc.collect()
     return rows_out, sheet_name
-def build_stock_excel(rows: list[dict], sheet_name: str) -> bytes:
-    """بيبني Excel بنفس فورمات البوت الموجود"""
-    wb = openpyxl.Workbook(write_only=False)
-    ws = wb.active
-    ws.title = sheet_name[:31]  # Excel بيقبل 31 حرف بس
-    ws.sheet_view.rightToLeft = True
-
-    headers = ["كود الصنف", "اسم الصنف", "الوحدة",
-               "رصيد أول الشهر", "الوارد", "المنصرف", "الرصيد الختامي"]
-    col_widths = [15, 35, 10, 18, 12, 12, 16]
-
-    hdr_fill = PatternFill("solid", fgColor="1B3A6B")
-    bd = Border(*[Side(style="thin", color="CCCCCC")] * 4)
-
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col, value=h)
-        c.fill = hdr_fill
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = bd
-
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
-
-    for r_idx, row in enumerate(rows, 2):
-        rf = PatternFill("solid", fgColor="F8F9FA" if r_idx % 2 == 0 else "FFFFFF")
-        vals = [
-            row.get("كود الصنف", ""),
-            row.get("اسم الصنف", ""),
-            row.get("الوحدة", ""),
-            row.get("رصيد أول الشهر", 0),
-            row.get("الوارد", 0),
-            row.get("المنصرف", 0),
-            row.get("الرصيد الختامي", 0),
-        ]
-        for col, val in enumerate(vals, 1):
-            c = ws.cell(row=r_idx, column=col, value=val)
-            c.fill = rf
-            c.font = Font(name="Arial", size=9)
-            c.alignment = Alignment(
-                horizontal="center" if col != 2 else "right",
-                vertical="center"
-            )
-            c.border = bd
-        # رصيد سالب → أحمر
-        closing_val = vals[6]
-        if isinstance(closing_val, (int, float)) and closing_val < 0:
-            ws.cell(row=r_idx, column=7).font = Font(name="Arial", size=9, color="C0392B", bold=True)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    del wb, rows
-    gc.collect()
-    return buf.getvalue()
 def excel_to_text(data: bytes, max_rows=150) -> str:
     """قرا أول شيت بس وأول 150 صف"""
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
