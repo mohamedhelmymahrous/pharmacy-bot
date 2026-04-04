@@ -186,7 +186,54 @@ def extract_stock_pdf(data: bytes) -> tuple:
 
     del data
     gc.collect()
-    return rows_out, sheet_name
+return rows_out, sheet_name
+
+
+def build_stock_excel(rows, sheet_name):
+    wb = openpyxl.Workbook(write_only=False)
+    ws = wb.active
+    ws.title = sheet_name[:31]
+    ws.sheet_view.rightToLeft = True
+    headers = ["كود الصنف", "اسم الصنف", "الوحدة",
+               "رصيد أول الشهر", "الوارد", "المنصرف", "الرصيد الختامي"]
+    col_widths = [15, 35, 10, 18, 12, 12, 16]
+    hdr_fill = PatternFill("solid", fgColor="1B3A6B")
+    bd = Border(*[Side(style="thin", color="CCCCCC")] * 4)
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col, value=h)
+        c.fill = hdr_fill
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = bd
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    for r_idx, row in enumerate(rows, 2):
+        rf = PatternFill("solid", fgColor="F8F9FA" if r_idx % 2 == 0 else "FFFFFF")
+        vals = [
+            row.get("كود الصنف", ""),
+            row.get("اسم الصنف", ""),
+            row.get("الوحدة", ""),
+            row.get("رصيد أول الشهر", 0),
+            row.get("الوارد", 0),
+            row.get("المنصرف", 0),
+            row.get("الرصيد الختامي", 0),
+        ]
+        for col, val in enumerate(vals, 1):
+            c = ws.cell(row=r_idx, column=col, value=val)
+            c.fill = rf
+            c.font = Font(name="Arial", size=9)
+            c.alignment = Alignment(
+                horizontal="center" if col != 2 else "right",
+                vertical="center"
+            )
+            c.border = bd
+        if isinstance(vals[6], (int, float)) and vals[6] < 0:
+            ws.cell(row=r_idx, column=7).font = Font(name="Arial", size=9, color="C0392B", bold=True)
+    buf = io.BytesIO()
+    wb.save(buf)
+    del wb, rows
+    gc.collect()
+    return buf.getvalue()
 def excel_to_text(data: bytes, max_rows=150) -> str:
     """قرا أول شيت بس وأول 150 صف"""
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
