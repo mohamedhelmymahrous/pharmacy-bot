@@ -767,8 +767,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files  = pending_files[cid_str]
         pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
         excels = [(t,d,n) for t,d,n in files if t=="excel"]
-
-        # الحالة 1: ملفات المرضى والمؤشرات بس (2 Excel بدون PDF)
+# الحالة 1: ملفات المرضى والمؤشرات بس (2 Excel بدون PDF)
         if count >= 2 and len(pdfs) == 0 and len(excels) >= 2:
             await msg.reply_text("✅ استلمت الملفات!\nجاري التحليل... ⏳")
             files = pending_files.pop(cid_str)
@@ -799,35 +798,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 gc.collect()
             return
-# الحالة الجديدة: PDF Stock Balance وحده
-    if count == 1 and len(pdfs) == 1:
-        fname_lower = pdfs[0][2].lower()
-        # كشف تلقائي: لو اسم الملف يحتوي على كلمات دالة
-        stock_keywords = ["stock", "balance", "جرد", "رصيد", "inventory", "report"]
-        is_stock = any(kw in fname_lower for kw in stock_keywords)
-        if is_stock:
-            await msg.reply_text("📊 تم التعرف على تقرير الرصيد...\nجاري المعالجة ⏳")
-            files = pending_files.pop(cid_str)
-            try:
-                rows, sheet_name = extract_stock_pdf(files[0][1])
-                if not rows:
-                    await context.bot.send_message(chat_id, "❌ مش قادر أستخرج بيانات من الـ PDF، تأكد من وجود جدول بأعمدة الرصيد.")
-                    return
-                xlsx_data = build_stock_excel(rows, sheet_name)
-                safe_name = sheet_name.replace(" ", "_")
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=io.BytesIO(xlsx_data),
-                    filename=f"{safe_name}.xlsx",
-                    caption=f"✅ {sheet_name} جاهز!\n📦 {len(rows)} صنف"
-                )
-            except Exception as e:
-                logger.error(f"Stock PDF error: {e}")
-                await context.bot.send_message(chat_id, f"❌ خطأ في معالجة الـ PDF: {str(e)}")
-            finally:
-                gc.collect()
-            return
-        
+
+        # الحالة الجديدة: PDF Stock Balance وحده
+        if count == 1 and len(pdfs) == 1:
+            fname_lower = pdfs[0][2].lower()
+            stock_keywords = ["stock", "balance", "جرد", "رصيد", "inventory", "report"]
+            is_stock = any(kw in fname_lower for kw in stock_keywords)
+            if is_stock:
+                await msg.reply_text("📊 تم التعرف على تقرير الرصيد...\nجاري المعالجة ⏳")
+                files = pending_files.pop(cid_str)
+                try:
+                    rows, sheet_name = extract_stock_pdf(files[0][1])
+                    if not rows:
+                        await context.bot.send_message(chat_id, "❌ مش قادر أستخرج بيانات من الـ PDF، تأكد من وجود جدول بأعمدة الرصيد.")
+                        return
+                    xlsx_data = build_stock_excel(rows, sheet_name)
+                    safe_name = sheet_name.replace(" ", "_")
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=io.BytesIO(xlsx_data),
+                        filename=f"{safe_name}.xlsx",
+                        caption=f"✅ {sheet_name} جاهز!\n📦 {len(rows)} صنف"
+                    )
+                except Exception as e:
+                    logger.error(f"Stock PDF error: {e}")
+                    await context.bot.send_message(chat_id, f"❌ خطأ في معالجة الـ PDF: {str(e)}")
+                finally:
+                    gc.collect()
+                return
+
         # الحالة 2: ملفات الجرد (Excel + 2 PDF)
         if count >= 3 and len(pdfs) >= 2 and len(excels) >= 1:
             await msg.reply_text("✅ استلمت ملفات الجرد!\nجاري البناء... ⏳")
@@ -923,6 +922,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"للاتنين: ابعت الـ 5 مع بعض"
         )
         return
+
+
+
 
     if msg.text:
         text = msg.text.strip()
