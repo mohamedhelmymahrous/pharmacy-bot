@@ -1,938 +1,276 @@
 import os
-import json
+import io
+import re
+import gc
 import logging
-import asyncio
-from datetime import datetime
+import tempfile
+from difflib import SequenceMatcher
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import pdfplumber
-import io
-import random
-import gc
+import openpyxl
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(**name**)
+
+TELEGRAM_TOKEN = os.environ.get(“TELEGRAM_TOKEN”, “”)
+
+# ════════════════════════════════════════════════════════════════════════════
+
+# 1. استخراج الأصناف من الـ PDF
+
+# ════════════════════════════════════════════════════════════════════════════
+
+_ITEM_RE   = re.compile(r’^\d+\s+\d{3}-\d{5}-(.*?)\s+UOM:\s*(.+)$’)
+_TOTAL4_RE = re.compile(
+r’^Total\s+([\d,]+(?:.\d+)?)\s+([\d,]+(?:.\d+)?)’
+r’\s+([\d,]+(?:.\d+)?)\s+([\d,]+(?:.\d+)?)$’
+)
+_TOTAL3_RE = re.compile(
+r’^Total\s+([\d,]+(?:.\d+)?)\s+([\d,]+(?:.\d+)?)\s+([\d,]+(?:.\d+)?)$’
+)
+
+def _to_num(s):
+return float(s.replace(’,’, ‘’))
+
+def extract_items_from_pdf(pdf_bytes):
+items   = []
+current = None
+with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+for page in pdf.pages:
+text = page.extract_text()
+if not text:
+continue
+for raw_line in text.split(’\n’):
+line = raw_line.strip()
+m = _ITEM_RE.match(line)
+if m:
+current = {‘name’: m.group(1).strip().upper(),
+‘uom’:  m.group(2).strip()}
+continue
+m4 = _TOTAL4_RE.match(line)
+if m4 and current:
+current.update({‘bfw’: _to_num(m4.group(1)), ‘received’: _to_num(m4.group(2)),
+‘issued’: _to_num(m4.group(3)), ‘balance’: _to_num(m4.group(4))})
+items.append(current); current = None; continue
+m3 = _TOTAL3_RE.match(line)
+if m3 and current:
+current.update({‘bfw’: 0.0, ‘received’: _to_num(m3.group(1)),
+‘issued’: _to_num(m3.group(2)), ‘balance’: _to_num(m3.group(3))})
+items.append(current); current = None
+gc.collect()
+return items
+
+# ════════════════════════════════════════════════════════════════════════════
+
+# 2. مطابقة أسماء الأدوية
+
+# ════════════════════════════════════════════════════════════════════════════
+
+_GENERIC = {
+‘FILM’,‘COATED’,‘ORAL’,‘EXTENDED’,‘RELEASE’,‘MODIFIED’,‘COMP’,
+‘CHEWABLE’,‘INFUSION’,‘SACHET’,‘POWDER’,‘PATCH’,‘EFFERVESCENT’,
+‘ENTERIC’,‘SUBLINGUAL’,‘TOPICAL’,‘FORTE’,‘PLUS’,‘MINI’,‘MICRO’,
+‘NANO’,‘RETARD’,‘DEPOT’,‘LONG’,‘SLOW’,‘INSTANT’,‘RAPID’,‘SOFT’,
+‘HARD’,‘GELATIN’,‘SUPPOSITORY’,‘ENEMA’,‘PACK’,‘STRIP’,
+}
+_FORMS = {
+‘TABLET’,‘TABLETS’,‘TABS’,‘CAPSULE’,‘CAPSULES’,‘CAPS’,
+‘SYRUP’,‘SUSPENSION’,‘DROPS’,‘CREAM’,‘OINTMENT’,
+‘INJECTION’,‘AMPOULE’,‘INHALER’,‘SPRAY’,‘LOTION’,
+‘GEL’,‘SOLUTION’,‘VIAL’,‘CHEW’,
+}
+
+def _normalize(name):
+return re.sub(r’(\d+)\s+(MG|ML|MCG|IU|G)\b’, r’\1\2’, name)
+
+def _key_number(name):
+m = re.search(r’(\d+(?:.\d+)?)(?:MG|ML|MCG|IU|G)(?:/\d+(?:MG|ML))?’, name)
+if m: return m.group(1)
+m = re.search(r’\b(\d+)\s*$’, name.rstrip())
+if m: return m.group(1)
+return None
+
+def _mwords(name):
+return [w for w in name.split() if len(w) > 3 and w not in _GENERIC and w not in _FORMS]
+
+def _form(name):
+return set(name.split()) & _FORMS
+
+def match_score(pdf_name, excel_name):
+pdf_name   = _normalize(pdf_name)
+excel_name = _normalize(excel_name)
+if pdf_name == excel_name: return 1.0
+excel_mw = _mwords(excel_name)
+pdf_mw   = _mwords(pdf_name)
+base = (any(w in pdf_name for w in excel_mw) or
+any(w in excel_name for w in pdf_mw[:2]))
+if not base:
+return SequenceMatcher(None, pdf_name[:20], excel_name[:20]).ratio()
+score = 0.75
+pn, en = _key_number(pdf_name), _key_number(excel_name)
+if pn and en:
+score += 0.20 if pn == en else -0.40
+pf, ef = _form(pdf_name), _form(excel_name)
+if pf and ef:
+score += 0.10 if pf & ef else -0.40
+elif pf and not ef:
+excel_wc = len([w for w in excel_name.split() if w not in _GENERIC])
+if not (excel_wc <= 2 and not en):
+score -= 0.10
+return max(0.0, min(score, 1.0))
+
+# ════════════════════════════════════════════════════════════════════════════
+
+# 3. ملء الإكسيل
+
+# ════════════════════════════════════════════════════════════════════════════
+
+def fill_excel(template_bytes, pdf_items):
+with tempfile.NamedTemporaryFile(suffix=’.xlsx’, delete=False) as tmp:
+tmp.write(template_bytes)
+tmp_path = tmp.name
+try:
+wb = openpyxl.load_workbook(tmp_path)
+ws = wb[‘Sheet1’]
+matched = 0
+unmatched = 0
+for row_idx in range(3, ws.max_row + 1):
+cell_name = ws.cell(row=row_idx, column=2).value
+if not cell_name or not str(cell_name).strip():
+continue
+excel_upper = str(cell_name).strip().upper()
+best_score, best_item = 0.0, None
+for item in pdf_items:
+s = match_score(item[‘name’], excel_upper)
+if s > best_score:
+best_score = s; best_item = item
+if best_score >= 0.75 and best_item:
+r = row_idx
+ws.cell(row=r, column=5).value  = int(best_item[‘bfw’])
+ws.cell(row=r, column=6).value  = int(best_item[‘received’]) if best_item[‘received’] else None
+ws.cell(row=r, column=10).value = int(best_item[‘issued’])   if best_item[‘issued’]   else None
+if not ws.cell(row=r, column=9).value:
+ws.cell(row=r, column=9).value  = f”=E{r}+F{r}+G{r}+H{r}”
+if not ws.cell(row=r, column=11).value:
+ws.cell(row=r, column=11).value = f”=I{r}-J{r}”
+matched += 1
+else:
+unmatched += 1
+wb.save(tmp_path)
+wb.close()
+with open(tmp_path, ‘rb’) as f:
+result = f.read()
+return result, matched, unmatched
+finally:
+os.unlink(tmp_path)
+gc.collect()
+
+# ════════════════════════════════════════════════════════════════════════════
+
+# 4. البوت
+
+# ════════════════════════════════════════════════════════════════════════════
+
+pending = {}  # {chat_id: {‘pdf’: bytes, ‘excel’: bytes}}
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GEMINI_KEY     = os.environ.get("GEMINI_KEY", "")
-ADMIN_CHAT_ID  = int(os.environ.get("ADMIN_CHAT_ID", "0"))
-CLIENTS_FILE   = "clients.json"
-
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-def load_clients():
-    if os.path.exists(CLIENTS_FILE):
-        with open(CLIENTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_clients(clients):
-    with open(CLIENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(clients, f, ensure_ascii=False, indent=2)
-
-def is_active(chat_id):
-    if str(chat_id) == str(ADMIN_CHAT_ID):
-        return True
-    return load_clients().get(str(chat_id), {}).get("active", False)
-
-pending_files   = {}
-pending_answers = {}
-
-def extract_pdf_text(data: bytes, max_pages=5) -> str:
-    text = ""
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for i, page in enumerate(pdf.pages):
-            if i >= max_pages:
-                break
-            t = page.extract_text()
-            if t:
-                text += t + "\n"
-    del data
-    gc.collect()
-    return text[:3000]
-
-
-def extract_stock_pdf(data: bytes) -> tuple:
-    import re
-
-    def clean_num(val):
-        if val is None:
-            return 0.0
-        s = re.sub(r"[^\d.\-]", "", str(val).replace(",", ""))
-        try:
-            return float(s) if s else 0.0
-        except:
-            return 0.0
-
-    def extract_month_year(pdf):
-        months_en = {
-            "january": "يناير", "february": "فبراير", "march": "مارس",
-            "april": "ابريل", "may": "مايو", "june": "يونيو",
-            "july": "يوليو", "august": "اغسطس", "september": "سبتمبر",
-            "october": "اكتوبر", "november": "نوفمبر", "december": "ديسمبر"
-        }
-        try:
-            text = pdf.pages[0].extract_text() or ""
-            year_m = re.search(r"\b(20\d{2})\b", text)
-            year = year_m.group(1) if year_m else datetime.now().strftime("%Y")
-            for eng, ar in months_en.items():
-                if eng in text.lower():
-                    return f"{ar} {year}"
-        except:
-            pass
-        return datetime.now().strftime("%B %Y")
-
-    CODE_PATTERN = re.compile(r'^(\d{3}-\d{5})$')
-
-    rows_out = []
-    sheet_name = "جرد"
-
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        sheet_name = "منصرف شهر " + extract_month_year(pdf)
-
-        for page in pdf.pages:
-            words = page.extract_words(x_tolerance=5, y_tolerance=5)
-            if not words:
-                continue
-
-            lines = {}
-            for w in words:
-                y = round(w['top'] / 5) * 5
-                lines.setdefault(y, []).append(w)
-
-            sorted_ys = sorted(lines.keys())
-            line_texts = []
-            for y in sorted_ys:
-                row_words = sorted(lines[y], key=lambda w: w['x0'])
-                line_texts.append([w['text'] for w in row_words])
-
-            i = 0
-            while i < len(line_texts):
-                line = line_texts[i]
-
-                codes_in_line = [w for w in line if CODE_PATTERN.match(w)]
-                if not codes_in_line:
-                    i += 1
-                    continue
-
-                item_code = codes_in_line[0]
-                code_idx = line.index(item_code)
-                name_words = line[code_idx+1:]
-                item_name = " ".join(name_words)
-
-                nums_found = False
-                for j in range(i+1, min(i+10, len(line_texts))):
-                    nums_line = line_texts[j]
-                    all_nums = []
-                    for w in nums_line:
-                        w_clean = w.replace(",", "").replace("*", "")
-                        if re.match(r'^\d+(\.\d+)?$', w_clean):
-                            all_nums.append(float(w_clean))
-
-                    if len(all_nums) >= 8:
-                        try:
-                            bfw     = all_nums[0]
-                            receipt = all_nums[3]
-                            issue   = all_nums[6]
-                            closing = bfw + receipt - issue
-
-                            if item_name.strip():
-                                rows_out.append({
-                                    "كود الصنف":       item_code,
-                                    "اسم الصنف":       item_name.strip(),
-                                    "الوحدة":          "",
-                                    "رصيد أول الشهر": bfw,
-                                    "الوارد":          receipt,
-                                    "المنصرف":         issue,
-                                    "الرصيد الختامي": closing,
-                                    "_bfw": bfw, "_receipt": receipt,
-                                    "_issue": issue, "_closing": closing
-                                })
-                                nums_found = True
-                        except:
-                            pass
-                        if nums_found:
-                            i = j
-                            break
-                i += 1
-
-    for r in rows_out:
-        expected = r["_bfw"] + r["_receipt"] - r["_issue"]
-        if abs(expected - r["_closing"]) > 0.01:
-            logger.warning(f"mismatch: {r['اسم الصنف']}")
-
-    del data
-    gc.collect()
-    return rows_out, sheet_name
-
-
-def build_stock_excel(rows, sheet_name):
-    wb = openpyxl.Workbook(write_only=False)
-    ws = wb.active
-    ws.title = sheet_name[:31]
-    ws.sheet_view.rightToLeft = True
-    headers = ["كود الصنف", "اسم الصنف", "الوحدة",
-               "رصيد أول الشهر", "الوارد", "المنصرف", "الرصيد الختامي"]
-    col_widths = [15, 35, 10, 18, 12, 12, 16]
-    hdr_fill = PatternFill("solid", fgColor="1B3A6B")
-    bd = Border(*[Side(style="thin", color="CCCCCC")] * 4)
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col, value=h)
-        c.fill = hdr_fill
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = bd
-    for i, w in enumerate(col_widths, 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
-    for r_idx, row in enumerate(rows, 2):
-        rf = PatternFill("solid", fgColor="F8F9FA" if r_idx % 2 == 0 else "FFFFFF")
-        vals = [
-            row.get("كود الصنف", ""),
-            row.get("اسم الصنف", ""),
-            row.get("الوحدة", ""),
-            row.get("رصيد أول الشهر", 0),
-            row.get("الوارد", 0),
-            row.get("المنصرف", 0),
-            row.get("الرصيد الختامي", 0),
-        ]
-        for col, val in enumerate(vals, 1):
-            c = ws.cell(row=r_idx, column=col, value=val)
-            c.fill = rf
-            c.font = Font(name="Arial", size=9)
-            c.alignment = Alignment(
-                horizontal="center" if col != 2 else "right",
-                vertical="center"
-            )
-            c.border = bd
-        if isinstance(vals[6], (int, float)) and vals[6] < 0:
-            ws.cell(row=r_idx, column=7).font = Font(name="Arial", size=9, color="C0392B", bold=True)
-    buf = io.BytesIO()
-    wb.save(buf)
-    del wb, rows
-    gc.collect()
-    return buf.getvalue()
-
-
-def excel_to_text(data: bytes, max_rows=150) -> str:
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    out = []
-    for name in wb.sheetnames[:5]:
-        ws = wb[name]
-        out.append(f"\n=== شيت: {name} ===")
-        for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-            if i > max_rows:
-                break
-            vals = [str(v) if v is not None else "" for v in row]
-            if any(v.strip() for v in vals):
-                out.append(" | ".join(vals))
-    wb.close()
-    del data
-    gc.collect()
-    return "\n".join(out)[:4000]
-
-def excel_to_text_full(data: bytes, max_rows=150) -> str:
-    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    out = []
-    for name in wb.sheetnames:
-        ws = wb[name]
-        out.append(f"\n=== شيت: {name} ===")
-        for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-            if i > max_rows:
-                break
-            vals = [str(v) if v is not None else "" for v in row]
-            if any(v.strip() for v in vals):
-                out.append(" | ".join(vals))
-    wb.close()
-    del data
-    gc.collect()
-    return "\n".join(out)[:5000]
-
-async def call_gemini(prompt: str) -> str:
-    response = await asyncio.to_thread(model.generate_content, prompt)
-    result = response.text
-    gc.collect()
-    return result
-
-def parse_json_safe(text: str):
-    import re
-    text = text.strip()
-    m = re.search(r'[\[{]', text)
-    if not m:
-        return None
-    start = m.start()
-    end = max(text.rfind("]"), text.rfind("}"))
-    if end == -1:
-        return None
-    try:
-        return json.loads(text[start:end+1])
-    except:
-        return None
-
-async def classify_files(files):
-    summaries = []
-    for ftype, data, fname in files:
-        if ftype == "pdf":
-            preview = extract_pdf_text(data, max_pages=2)[:400]
-        else:
-            preview = excel_to_text(data, max_rows=8)[:400]
-        summaries.append(f"ملف: {fname} ({ftype})\n{preview}\n---")
-        gc.collect()
-
-    prompt = f"""صنّف كل ملف:
-- inventory_prev: شيت جرد Excel (أدوية ورصيد)
-- pdf_incoming: PDF وارد
-- pdf_dispensed: PDF منصرف
-- pdf_stock_balance: PDF تقرير رصيد مخزون (Stock Balance Report, يحتوي جدول بأعمدة opening/receipt/issue)
-- patients_sheet: شيت مرضى Excel
-- kpi_sheet: شيت مؤشرات Excel (شيتات كتير)
-
-{chr(10).join(summaries)}
-
-JSON فقط:
-[{{"filename": "...", "category": "..."}}, ...]"""
-
-    result = await call_gemini(prompt)
-    return parse_json_safe(result)
-
-async def build_inventory(prev_data: bytes, incoming_text: str, dispensed_text: str, month: str) -> bytes:
-    prev_text = excel_to_text(prev_data, max_rows=400)
-
-    prompt = f"""صيدلاني خبير. ابني شيت جرد {month}.
-
-الجرد السابق (أول 400 صنف):
-{prev_text[:3000]}
-
-الوارد:
-{incoming_text[:1500]}
-
-المنصرف:
-{dispensed_text[:1500]}
-
-رصيد أول الشهر = متبقي سابق
-المجموع = رصيد + وارد
-المتبقي = مجموع - منصرف
-طابق الأسماء بذكاء
-
-JSON فقط:
-[{{"اسم_الصنف":"...","رصيد_اول_الشهر":0,"الوارد":0,"المجموع":0,"المنصرف":0,"المتبقي":0}}]"""
-
-    result = await call_gemini(prompt)
-    rows = parse_json_safe(result) or []
-    gc.collect()
-
-    wb = openpyxl.Workbook(write_only=False)
-    ws = wb.active
-    ws.title = month
-    ws.sheet_view.rightToLeft = True
-
-    headers = ["اسم الصنف","رصيد أول الشهر","الوارد","المجموع","المنصرف","المتبقي"]
-    hdr_fill = PatternFill("solid", fgColor="1B3A6B")
-    bd = Border(*[Side(style="thin", color="CCCCCC")]*4)
-
-    for col, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=col, value=h)
-        c.fill = hdr_fill
-        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border = bd
-
-    for i, w in enumerate([30,15,10,10,10,10], 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
-
-    for r, row in enumerate(rows, 2):
-        rf = PatternFill("solid", fgColor="F8F9FA" if r%2==0 else "FFFFFF")
-        vals = [row.get("اسم_الصنف",""), row.get("رصيد_اول_الشهر",0),
-                row.get("الوارد",0), row.get("المجموع",0),
-                row.get("المنصرف",0), row.get("المتبقي",0)]
-        for col, val in enumerate(vals, 1):
-            c = ws.cell(row=r, column=col, value=val)
-            c.fill = rf
-            c.font = Font(name="Arial", size=9)
-            c.alignment = Alignment(horizontal="center" if col>1 else "right", vertical="center")
-            c.border = bd
-        if isinstance(vals[5], (int,float)) and vals[5] < 0:
-            ws.cell(row=r, column=6).font = Font(name="Arial", size=9, color="C0392B", bold=True)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    del rows, wb
-    gc.collect()
-    return buf.getvalue()
-
-async def fill_kpi_sheet(kpi_data: bytes, patients_data: bytes, month: str):
-    patients_text = excel_to_text(patients_data, max_rows=200)
-
-    wb_p = openpyxl.load_workbook(io.BytesIO(patients_data), data_only=True, read_only=True)
-    ws_p = wb_p.active
-    all_patients = []
-    for i, row in enumerate(ws_p.iter_rows(min_row=2, values_only=True)):
-        if i >= 200:
-            break
-        name = row[0]
-        mid  = row[1] if len(row) > 1 else None
-        if name and str(name).strip():
-            all_patients.append((str(name).strip(), str(mid).strip() if mid else ""))
-    wb_p.close()
-    del patients_data
-    gc.collect()
-
-    sample1 = random.sample(all_patients, min(30, len(all_patients)))
-    sample2 = random.sample(all_patients, min(30, len(all_patients)))
-
-    stats_prompt = f"""من شيت المرضى استخرج:
-{patients_text[:2000]}
-
-JSON فقط:
-{{"total_prescriptions":0,"ab_prescriptions":0,"inappropriate_ab":0,"ab_protocol_adherence":0,"current_medication_count":0,"appropriateness_count":0,"counselling_count":0,"interventions_count":0}}"""
-
-    stats_result = await call_gemini(stats_prompt)
-    stats = parse_json_safe(stats_result) or {}
-    gc.collect()
-
-    total  = stats.get("total_prescriptions", len(all_patients))
-    ab     = stats.get("ab_prescriptions", 0)
-    inapp  = stats.get("inappropriate_ab", 0)
-    proto  = stats.get("ab_protocol_adherence", ab)
-    curmd  = stats.get("current_medication_count", total)
-    appr   = stats.get("appropriateness_count", total)
-    couns  = stats.get("counselling_count", total)
-    interv = stats.get("interventions_count", 0)
-
-    months_ar = ["يناير","فبراير","مارس","ابريل","مايو","يونيو",
-                 "يوليو","اغسطس","سبتمبر","اكتوبر","نوفمبر","ديسمبر"]
-    month_col = 2
-    for i, m in enumerate(months_ar, 2):
-        if m in month or month in m:
-            month_col = i
-            break
-
-    wb_kpi = openpyxl.load_workbook(io.BytesIO(kpi_data))
-    del kpi_data
-    gc.collect()
-
-    def write_month(sheet_name, numerator, denominator=None, row_num=3, row_total=4):
-        if sheet_name not in wb_kpi.sheetnames:
-            return
-        ws = wb_kpi[sheet_name]
-        ws.cell(row=row_num, column=month_col, value=numerator)
-        if denominator is not None:
-            ws.cell(row=row_total, column=month_col, value=denominator)
-
-    write_month("AB orders",             ab,    total)
-    write_month("AB inappropriate use",  inapp, ab)
-    write_month("AB protocols adherence",proto, ab)
-    write_month("current medication",    curmd, total)
-    write_month("appropriatness ",       appr,  total)
-    write_month("councelling",           couns, total)
-    write_month("cost savings",          interv)
-
-    if "اسماء المرضي" in wb_kpi.sheetnames:
-        ws_names = wb_kpi["اسماء المرضي"]
-        for i, (name, mid) in enumerate(sample1, 5):
-            ws_names.cell(row=i, column=1, value=i-4)
-            ws_names.cell(row=i, column=2, value=name)
-            ws_names.cell(row=i, column=3, value=mid)
-            for col in range(4, 8):
-                ws_names.cell(row=i, column=col, value=1)
-
-    if "شيت الاعطاء " in wb_kpi.sheetnames:
-        ws_give = wb_kpi["شيت الاعطاء "]
-        for i, (name, mid) in enumerate(sample2, 5):
-            ws_give.cell(row=i, column=1, value=i-4)
-            ws_give.cell(row=i, column=2, value=name)
-            ws_give.cell(row=i, column=3, value=mid)
-            ws_give.cell(row=i, column=4, value=1)
-
-    buf = io.BytesIO()
-    wb_kpi.save(buf)
-    del wb_kpi
-    gc.collect()
-
-    questions = f"""✅ ملأت اللي أقدر عليه!
-
-محتاج أرقام {month}:
-
-1️⃣ التخزين:
-ثلاجة / إجمالي
-ضوء / إجمالي
-LASA شكل / إجمالي
-LASA نطق / إجمالي
-
-2️⃣ High Alert & HC:
-HA / إجمالي
-HC / إجمالي
-مراجعة ثنائية / وصفات
-
-3️⃣ راكد / إجمالي
-4️⃣ ناقص / إجمالي
-5️⃣ كروت / إجمالي
-6️⃣ أخطاء دوائية
-7️⃣ Near Miss
-8️⃣ آثار عكسية
-9️⃣ تدخلات دوائية
-🔟 توفير بالجنيه
-
-مثال:
-12/12 | 20/20 | 15/15 | 8/8 | 16/16 | 1/1 | 117/117 | 0/220 | 9/220 | 195/195 | 3 | 3 | 0 | 0 | 0"""
-
-    return buf.getvalue(), questions
-
-async def complete_kpi(kpi_data: bytes, answers_text: str, month: str) -> bytes:
-    parts = [p.strip() for p in answers_text.replace("\n","|").split("|") if p.strip()]
-
-    def get_pair(idx):
-        if idx < len(parts) and "/" in parts[idx]:
-            a, b = parts[idx].split("/", 1)
-            try:
-                return int(a.strip()), int(b.strip())
-            except:
-                return 0, 0
-        return 0, 0
-
-    def get_single(idx):
-        if idx < len(parts):
-            try:
-                return int(parts[idx].strip())
-            except:
-                return 0
-        return 0
-
-    fridge_ok,  fridge_tot  = get_pair(0)
-    light_ok,   light_tot   = get_pair(1)
-    lasa_s_ok,  lasa_s_tot  = get_pair(2)
-    lasa_n_ok,  lasa_n_tot  = get_pair(3)
-    ha_ok,      ha_tot      = get_pair(4)
-    hc_ok,      hc_tot      = get_pair(5)
-    double_ok,  double_tot  = get_pair(6)
-    stale_n,    stale_tot   = get_pair(7)
-    short_n,    short_tot   = get_pair(8)
-    cards_ok,   cards_tot   = get_pair(9)
-    errors                  = get_single(10)
-    near_miss               = get_single(11)
-    adv_events              = get_single(12)
-    interventions           = get_single(13)
-    savings                 = get_single(14)
-
-    months_ar = ["يناير","فبراير","مارس","ابريل","مايو","يونيو",
-                 "يوليو","اغسطس","سبتمبر","اكتوبر","نوفمبر","ديسمبر"]
-    month_col = 2
-    for i, m in enumerate(months_ar, 2):
-        if m in month or month in m:
-            month_col = i
-            break
-
-    wb = openpyxl.load_workbook(io.BytesIO(kpi_data))
-    del kpi_data
-    gc.collect()
-
-    def w(sheet, row, val):
-        if sheet in wb.sheetnames:
-            wb[sheet].cell(row=row, column=month_col, value=val)
-
-    if "التخزين السليم للادوية " in wb.sheetnames:
-        ws = wb["التخزين السليم للادوية "]
-        base = (month_col - 2) * 7 + 2
-        for i, (v, t) in enumerate([(fridge_ok,fridge_tot),(light_ok,light_tot),(lasa_s_ok,lasa_s_tot),(lasa_n_ok,lasa_n_tot)]):
-            ws.cell(row=5, column=base+i, value=v)
-            ws.cell(row=7, column=base+i, value=t)
-
-    if "ادوية عالية الخطورة والتركيز" in wb.sheetnames:
-        ws = wb["ادوية عالية الخطورة والتركيز"]
-        base = (month_col - 2) * 5 + 2
-        ws.cell(row=5, column=base,   value=ha_ok)
-        ws.cell(row=5, column=base+1, value=hc_ok)
-        ws.cell(row=5, column=base+2, value=double_ok)
-        ws.cell(row=7, column=base,   value=ha_tot)
-        ws.cell(row=7, column=base+1, value=hc_tot)
-        ws.cell(row=7, column=base+2, value=double_tot)
-
-    if "HA & HC اثناء الاعطاء" in wb.sheetnames:
-        ws = wb["HA & HC اثناء الاعطاء"]
-        ws.cell(row=3, column=month_col, value=double_ok)
-        ws.cell(row=4, column=month_col, value=double_tot)
-
-    if "نسبة الرواكد والنواقص" in wb.sheetnames:
-        ws = wb["نسبة الرواكد والنواقص"]
-        ws.cell(row=3,  column=month_col, value=stale_n)
-        ws.cell(row=4,  column=month_col, value=stale_tot)
-        ws.cell(row=27, column=month_col, value=short_n)
-        ws.cell(row=28, column=month_col, value=short_tot)
-
-    if "كروت التعريف" in wb.sheetnames:
-        ws = wb["كروت التعريف"]
-        ws.cell(row=3, column=month_col, value=cards_ok)
-        ws.cell(row=4, column=month_col, value=cards_tot)
-
-    w("medication error", 3, errors)
-    if "near miss" in wb.sheetnames:
-        wb["near miss"].cell(row=3, column=month_col, value=near_miss)
-        wb["near miss"].cell(row=4, column=month_col, value=errors)
-    w("الاثار العكسية", 3, adv_events)
-    if "cost savings" in wb.sheetnames:
-        wb["cost savings"].cell(row=3, column=month_col, value=interventions)
-        wb["cost savings"].cell(row=4, column=month_col, value=savings)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    del wb
-    gc.collect()
-    return buf.getvalue()
-
-
-# ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg     = update.message
-    if not msg:
-        return
+chat_id = update.effective_chat.id
+msg     = update.message
+if not msg:
+return
 
-    if chat_id == ADMIN_CHAT_ID and msg.text:
-        text = msg.text.strip()
-
-        if text.startswith("تأكيد "):
-            name = text[6:].strip()
-            clients = load_clients()
-            for cid, data in clients.items():
-                if data.get("name") == name:
-                    clients[cid]["active"] = True
-                    save_clients(clients)
-                    await context.bot.send_message(int(cid), f"✅ تم تأكيد اشتراكك يا {name}! 🎉")
-                    await msg.reply_text(f"✅ تم تفعيل {name}")
-                    return
-            await msg.reply_text(f"❌ مش لاقي {name}")
-            return
-
-        if text.startswith("رفض "):
-            name = text[5:].strip()
-            clients = load_clients()
-            for cid, data in clients.items():
-                if data.get("name") == name:
-                    await context.bot.send_message(int(cid), "⚠️ لم يتم التحقق من الدفع، تواصل مع الإدارة")
-                    await msg.reply_text(f"تم إبلاغ {name}")
-                    return
-            return
-
-        if text.startswith("وقف "):
-            name = text[5:].strip()
-            clients = load_clients()
-            for cid, data in clients.items():
-                if data.get("name") == name:
-                    clients[cid]["active"] = False
-                    save_clients(clients)
-                    await context.bot.send_message(int(cid), "⛔ تم إيقاف اشتراكك.")
-                    await msg.reply_text(f"✅ تم إيقاف {name}")
-                    return
-
-        if text.startswith("فعل "):
-            name = text[5:].strip()
-            clients = load_clients()
-            for cid, data in clients.items():
-                if data.get("name") == name:
-                    clients[cid]["active"] = True
-                    save_clients(clients)
-                    await msg.reply_text(f"✅ تم تفعيل {name}")
-                    return
-
-        if text == "عملاء":
-            clients = load_clients()
-            if not clients:
-                await msg.reply_text("مفيش عملاء.")
-                return
-            lines = ["📋 العملاء:\n"]
-            for cid, data in clients.items():
-                status = "✅" if data.get("active") else "⛔"
-                lines.append(f"{status} {data.get('name','؟')} — {cid}")
-            await msg.reply_text("\n".join(lines))
-            return
-
-        if text.startswith("اضف عميل"):
-            parts = text.replace("اضف عميل","").strip().split()
-            if len(parts) >= 2:
-                name, cid = parts[0], parts[1]
-                clients = load_clients()
-                clients[cid] = {"name": name, "active": True, "joined": str(datetime.now().date())}
-                save_clients(clients)
-                await msg.reply_text(f"✅ تم إضافة {name}")
-                try:
-                    await context.bot.send_message(int(cid), f"أهلاً يا {name}! 👋\nتم تفعيل اشتراكك.")
-                except:
-                    pass
-            else:
-                await msg.reply_text("الصيغة: اضف عميل [اسم] [id]")
-            return
-
-        if text == "ابعت فواتير":
-            clients = load_clients()
-            count = 0
-            for cid, data in clients.items():
-                try:
-                    await context.bot.send_message(int(cid),
-                        f"مرحباً د. {data.get('name','')} 👋\n\n"
-                        f"اشتراك شهر {datetime.now().strftime('%B')} = 299 جنيه\n\n"
-                        f"برجاء السداد وإرسال صورة الإيصال ✅")
-                    count += 1
-                except:
-                    pass
-            await msg.reply_text(f"✅ تم الإرسال لـ {count} عميل")
-            return
-
-        if text == "/start":
-            await msg.reply_text(
-                "👨‍💼 لوحة تحكم المدير\n\n"
-                "• عملاء\n"
-                "• اضف عميل [اسم] [id]\n"
-                "• وقف [اسم]\n"
-                "• فعل [اسم]\n"
-                "• تأكيد [اسم]\n"
-                "• رفض [اسم]\n"
-                "• ابعت فواتير"
-            )
-            return
-
-    if not is_active(chat_id):
-        await msg.reply_text("⛔ اشتراكك غير فعّال.\nللاشتراك تواصل مع الإدارة.")
-        return
-
-    cid_str = str(chat_id)
-
-    if msg.photo and chat_id != ADMIN_CHAT_ID:
-        clients = load_clients()
-        client_name = clients.get(cid_str, {}).get("name", str(chat_id))
-        await msg.reply_text("📨 تم استلام صورة الإيصال، جاري المراجعة...")
-        await context.bot.forward_message(ADMIN_CHAT_ID, chat_id, msg.message_id)
-        await context.bot.send_message(ADMIN_CHAT_ID,
-            f"💰 {client_name} بعت إيصال\n\n"
-            f"تأكيد {client_name}\n"
-            f"رفض {client_name}")
-        return
-
-    if msg.document:
-        if cid_str not in pending_files:
-            pending_files[cid_str] = []
-
-        doc   = msg.document
-        fname = doc.file_name or "file"
-        fext  = fname.split(".")[-1].lower()
-        ftype = "pdf" if fext == "pdf" else "excel"
-
-        file_obj = await context.bot.get_file(doc.file_id)
-        data = bytes(await file_obj.download_as_bytearray())
-        pending_files[cid_str].append((ftype, data, fname))
-
-        count  = len(pending_files[cid_str])
-        files  = pending_files[cid_str]
-        pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
-        excels = [(t,d,n) for t,d,n in files if t=="excel"]
-
-        # الحالة 1: ملفات المرضى والمؤشرات بس (2 Excel بدون PDF)
-        if count >= 2 and len(pdfs) == 0 and len(excels) >= 2:
-            await msg.reply_text("✅ استلمت الملفات!\nجاري التحليل... ⏳")
-            files = pending_files.pop(cid_str)
-            excels = [(t,d,n) for t,d,n in files if t=="excel"]
-            try:
-                classifications = await classify_files(files)
-                file_map = {}
-                if classifications:
-                    for item in classifications:
-                        for ft, fd, fn in files:
-                            if fn == item.get("filename",""):
-                                file_map[item.get("category","")] = (ft, fd, fn)
-
-                patients = file_map.get("patients_sheet", excels[0] if excels else None)
-                kpi      = file_map.get("kpi_sheet",      excels[1] if len(excels)>1 else None)
-
-                if kpi and patients:
-                    month = datetime.now().strftime("%B %Y")
-                    await context.bot.send_message(chat_id, "📋 بنملأ شيت المؤشرات...")
-                    kpi_partial, questions = await fill_kpi_sheet(kpi[1], patients[1], month)
-                    pending_answers[cid_str] = {"kpi_data": kpi_partial, "month": month}
-                    await context.bot.send_message(chat_id, questions)
-                else:
-                    await context.bot.send_message(chat_id, "❌ مش قادر أحدد الملفات، جرب تاني.")
-            except Exception as e:
-                logger.error(f"Error: {e}")
-                await context.bot.send_message(chat_id, f"❌ خطأ: {str(e)}")
-            finally:
-                gc.collect()
-            return
-
-        # الحالة الجديدة: PDF Stock Balance وحده
-        if count == 1 and len(pdfs) == 1:
-            fname_lower = pdfs[0][2].lower()
-            stock_keywords = ["stock", "balance", "جرد", "رصيد", "inventory", "report"]
-            is_stock = any(kw in fname_lower for kw in stock_keywords)
-            if is_stock:
-                await msg.reply_text("📊 تم التعرف على تقرير الرصيد...\nجاري المعالجة ⏳")
-                files = pending_files.pop(cid_str)
-                try:
-                    rows, sheet_name = extract_stock_pdf(files[0][1])
-                    if not rows:
-                        await context.bot.send_message(chat_id, "❌ مش قادر أستخرج بيانات من الـ PDF، تأكد من وجود جدول بأعمدة الرصيد.")
-                        return
-                    xlsx_data = build_stock_excel(rows, sheet_name)
-                    safe_name = sheet_name.replace(" ", "_")
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=io.BytesIO(xlsx_data),
-                        filename=f"{safe_name}.xlsx",
-                        caption=f"✅ {sheet_name} جاهز!\n📦 {len(rows)} صنف"
-                    )
-                except Exception as e:
-                    logger.error(f"Stock PDF error: {e}")
-                    await context.bot.send_message(chat_id, f"❌ خطأ في معالجة الـ PDF: {str(e)}")
-                finally:
-                    gc.collect()
-                return
-
-        # الحالة 2: ملفات الجرد (Excel + 2 PDF)
-        if count >= 3 and len(pdfs) >= 2 and len(excels) >= 1:
-            await msg.reply_text("✅ استلمت ملفات الجرد!\nجاري البناء... ⏳")
-            files = pending_files.pop(cid_str)
-            pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
-            excels = [(t,d,n) for t,d,n in files if t=="excel"]
-            try:
-                classifications = await classify_files(files)
-                file_map = {}
-                if classifications:
-                    for item in classifications:
-                        for ft, fd, fn in files:
-                            if fn == item.get("filename",""):
-                                file_map[item.get("category","")] = (ft, fd, fn)
-
-                inv_prev = file_map.get("inventory_prev", excels[0] if excels else None)
-                pdf_in   = file_map.get("pdf_incoming",  pdfs[0] if pdfs else None)
-                pdf_dis  = file_map.get("pdf_dispensed", pdfs[1] if len(pdfs)>1 else None)
-
-                if inv_prev and pdf_in and pdf_dis:
-                    month    = datetime.now().strftime("%B %Y")
-                    inc_text = extract_pdf_text(pdf_in[1])
-                    dis_text = extract_pdf_text(pdf_dis[1])
-                    inv_xlsx = await build_inventory(inv_prev[1], inc_text, dis_text, month)
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=io.BytesIO(inv_xlsx),
-                        filename=f"جرد_{month}.xlsx",
-                        caption=f"✅ شيت جرد {month} جاهز!"
-                    )
-                else:
-                    await context.bot.send_message(chat_id, "❌ مش قادر أحدد الملفات، جرب تاني.")
-            except Exception as e:
-                logger.error(f"Error: {e}")
-                await context.bot.send_message(chat_id, f"❌ خطأ: {str(e)}")
-            finally:
-                gc.collect()
-            return
-
-        # الحالة 3: كل الملفات الـ 5
-        if count >= 5:
-            await msg.reply_text("✅ استلمت كل الملفات!\nجاري التحليل... ⏳\n(3-4 دقائق)")
-            files = pending_files.pop(cid_str)
-            pdfs   = [(t,d,n) for t,d,n in files if t=="pdf"]
-            excels = [(t,d,n) for t,d,n in files if t=="excel"]
-            try:
-                classifications = await classify_files(files)
-                file_map = {}
-                if classifications:
-                    for item in classifications:
-                        for ft, fd, fn in files:
-                            if fn == item.get("filename",""):
-                                file_map[item.get("category","")] = (ft, fd, fn)
-
-                inv_prev = file_map.get("inventory_prev", excels[0] if excels else None)
-                pdf_in   = file_map.get("pdf_incoming",  pdfs[0] if pdfs else None)
-                pdf_dis  = file_map.get("pdf_dispensed", pdfs[1] if len(pdfs)>1 else None)
-                patients = file_map.get("patients_sheet",excels[1] if len(excels)>1 else None)
-                kpi      = file_map.get("kpi_sheet",     excels[2] if len(excels)>2 else None)
-
-                month = datetime.now().strftime("%B %Y")
-
-                if inv_prev and pdf_in and pdf_dis:
-                    await context.bot.send_message(chat_id, "📊 بنبني شيت الجرد...")
-                    inc_text = extract_pdf_text(pdf_in[1])
-                    dis_text = extract_pdf_text(pdf_dis[1])
-                    inv_xlsx = await build_inventory(inv_prev[1], inc_text, dis_text, month)
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=io.BytesIO(inv_xlsx),
-                        filename=f"جرد_{month}.xlsx",
-                        caption="✅ شيت الجرد جاهز!"
-                    )
-                    gc.collect()
-
-                if kpi and patients:
-                    await context.bot.send_message(chat_id, "📋 بنملأ شيت المؤشرات...")
-                    kpi_partial, questions = await fill_kpi_sheet(kpi[1], patients[1], month)
-                    pending_answers[cid_str] = {"kpi_data": kpi_partial, "month": month}
-                    await context.bot.send_message(chat_id, questions)
-
-            except Exception as e:
-                logger.error(f"Error: {e}")
-                await context.bot.send_message(chat_id, f"❌ خطأ: {str(e)}")
-            finally:
-                gc.collect()
-            return
-
+```
+# ── رسائل نصية ──────────────────────────────────────────────────────────
+if msg.text:
+    if msg.text.strip() == '/start':
         await msg.reply_text(
-            f"📎 استلمت {count} ملف\n\n"
-            f"للجرد: ابعت Excel + PDF وارد + PDF منصرف\n"
-            f"للمؤشرات: ابعت Excel مرضى + Excel مؤشرات\n"
-            f"للاتنين: ابعت الـ 5 مع بعض"
+            "أهلاً! 👋\n\n"
+            "ابعتلي ملفين:\n"
+            "1️⃣ Stock Card Report (PDF)\n"
+            "2️⃣ شيت الجرد template (Excel)\n\n"
+            "مش مهم ترتيبهم ✅"
         )
+    else:
+        await msg.reply_text(
+            "📎 ابعتلي الملفين:\n"
+            "1️⃣ Stock Card Report (PDF)\n"
+            "2️⃣ شيت الجرد template (Excel)"
+        )
+    return
+
+# ── ملفات ───────────────────────────────────────────────────────────────
+if msg.document:
+    doc   = msg.document
+    fname = (doc.file_name or "").lower()
+    fext  = fname.split('.')[-1]
+
+    file_obj = await context.bot.get_file(doc.file_id)
+    data     = bytes(await file_obj.download_as_bytearray())
+
+    cid = str(chat_id)
+    if cid not in pending:
+        pending[cid] = {}
+
+    if fext == 'pdf':
+        pending[cid]['pdf'] = data
+        # لو الإكسيل موجود بالفعل → ابدأ
+        if 'excel' not in pending[cid]:
+            await msg.reply_text("✅ استلمت الـ PDF\nابعتلي شيت الإكسيل template")
+    elif fext in ('xlsx', 'xls'):
+        pending[cid]['excel'] = data
+        # لو الـ PDF موجود بالفعل → ابدأ
+        if 'pdf' not in pending[cid]:
+            await msg.reply_text("✅ استلمت الإكسيل\nابعتلي الـ PDF")
+    else:
+        await msg.reply_text("❌ بعتلي PDF أو Excel بس")
         return
 
-    if msg.text:
-        text = msg.text.strip()
+    # لو الاتنين وصلوا → شغّل
+    if 'pdf' in pending[cid] and 'excel' in pending[cid]:
+        files          = pending.pop(cid)
+        pdf_bytes      = files['pdf']
+        template_bytes = files['excel']
 
-        if cid_str in pending_answers and "/" in text:
-            await msg.reply_text("⏳ جاري استكمال المؤشرات...")
-            try:
-                data  = pending_answers.pop(cid_str)
-                month = data["month"]
-                kpi_complete = await complete_kpi(data["kpi_data"], text, month)
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=io.BytesIO(kpi_complete),
-                    filename=f"مؤشرات_{month}.xlsx",
-                    caption=f"✅ مؤشرات {month} مكتملة! 🎉"
+        await msg.reply_text("⏳ جاري المعالجة...")
+
+        try:
+            pdf_items = extract_items_from_pdf(pdf_bytes)
+
+            if not pdf_items:
+                await msg.reply_text(
+                    "❌ مش قادر أقرأ الـ PDF\n"
+                    "تأكد إنه Stock Card Report صح"
                 )
-            except Exception as e:
-                logger.error(f"KPI error: {e}")
-                await msg.reply_text(f"❌ خطأ: {str(e)}")
-            finally:
-                gc.collect()
-            return
+                return
 
-        if text == "/start":
-            clients = load_clients()
-            if cid_str not in clients and chat_id != ADMIN_CHAT_ID:
-                clients[cid_str] = {"name": f"مستخدم_{cid_str}", "active": False, "joined": str(datetime.now().date())}
-                save_clients(clients)
-                await context.bot.send_message(ADMIN_CHAT_ID,
-                    f"🆕 مستخدم جديد!\nID: {chat_id}\n\nللتفعيل: اضف عميل [الاسم] {chat_id}")
-            await msg.reply_text("أهلاً! 👋\nطلبك اتبعت للإدارة.")
-            return
+            excel_bytes, matched, unmatched = fill_excel(template_bytes, pdf_items)
 
-        await msg.reply_text(
-            "📎 ابعتلي الملفات:\n\n"
-            "للجرد (3 ملفات):\n"
-            "1️⃣ شيت الجرد السابق\n"
-            "2️⃣ PDF الوارد\n"
-            "3️⃣ PDF المنصرف\n\n"
-            "للمؤشرات (2 ملفات):\n"
-            "1️⃣ شيت المرضى\n"
-            "2️⃣ شيت المؤشرات\n\n"
-            "للاتنين (5 ملفات)"
-        )
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=io.BytesIO(excel_bytes),
+                filename="جرد.xlsx",
+                caption=(
+                    f"✅ جرد جاهز!\n\n"
+                    f"📦 أصناف في الـ PDF: {len(pdf_items)}\n"
+                    f"✅ تم ملء: {matched} صنف\n"
+                    f"⚪ صفر حركة: {unmatched} صنف"
+                )
+            )
+
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            await msg.reply_text(f"❌ حصل خطأ: {str(e)}")
+        finally:
+            gc.collect()
+```
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
-    logger.info("✅ البوت شغّال!")
-    app.run_polling(drop_pending_updates=True)
+app = Application.builder().token(TELEGRAM_TOKEN).build()
+app.add_handler(MessageHandler(filters.ALL, handle_message))
+logger.info(“✅ البوت شغال!”)
+app.run_polling(drop_pending_updates=True)
 
-if __name__ == "__main__":
-    main()
+if **name** == “**main**”:
+main()
