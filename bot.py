@@ -80,6 +80,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         wb, ws = load_excel()
         matcher, db_items = build_matcher()
+
+# 🔍 CHECK DATABASE FROM EXCEL
+print("🔵 DB SIZE:", len(db_items))
+print("🔵 SAMPLE ITEM:", db_items[0] if db_items else "EMPTY")
     except Exception as e:
         logger.error(f"Setup failed: {e}", exc_info=True)
         await msg.reply_text("❌ خطأ في تحميل قاعدة البيانات")
