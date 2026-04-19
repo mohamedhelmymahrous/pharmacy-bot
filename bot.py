@@ -9,7 +9,7 @@ import tempfile
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-from parser import extract_items_from_pdf
+from pdf_parser import extract_items_from_pdf
 from excel_manager import load_excel, sheet_to_db_list, update_excel, save_excel
 from database import build_matcher, sync_from_excel
 
