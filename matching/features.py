@@ -1,111 +1,93 @@
 """
 features.py
 -----------
-Converts a raw item dict into a structured, comparable FeatureSet.
-All normalization happens here using normalizer.py.
+Converts raw item dict → FeatureSet ready for scoring.
+Key fix: name_tokens contains ONLY drug name tokens (no strength/form).
 """
 from dataclasses import dataclass, field
 from typing import Optional
 from .normalizer import (
-    normalize_name,
+    extract_drug_base_name,
+    tokenize_drug_name,
     normalize_form,
     parse_strength,
     strength_to_base,
-    tokenize_name,
+    clean_text,
 )
 
 
 @dataclass
 class FeatureSet:
-    """
-    Structured representation of a pharmaceutical item for matching.
-    All fields are normalized and ready for comparison.
-    """
-    # Raw item identifier (optional, for traceability)
-    item_id: Optional[str] = None
+    # Traceability
+    item_id:  Optional[str] = None
+    code:     Optional[str] = None
 
-    # Name features
-    raw_name: str = ""
-    normalized_name: str = ""
-    name_tokens: set = field(default_factory=set)
+    # Name — ONLY brand/drug tokens, no strength or form
+    raw_name:        str = ""
+    base_name:       str = ""   # e.g. "ADWIFLAM"
+    name_tokens:     set = field(default_factory=set)  # e.g. {'ADWIFLAM'}
 
-    # Strength features
-    strength_value: Optional[float] = None   # numeric value
-    strength_unit: Optional[str] = None      # normalized unit (MG, ML, IU...)
-    strength_base_value: Optional[float] = None  # converted to base unit
-    strength_base_unit: Optional[str] = None
+    # Strength
+    strength_raw:        str           = ""
+    strength_value:      Optional[float] = None
+    strength_unit:       Optional[str]   = None
+    strength_base_value: Optional[float] = None
+    strength_base_unit:  Optional[str]   = None
 
-    # Form features
-    raw_form: str = ""
+    # Form
+    raw_form:      str = ""
     canonical_form: str = ""
 
-    # Company features (optional)
-    raw_company: str = ""
+    # Company (optional)
     company_tokens: set = field(default_factory=set)
-
-    # Code (optional, for exact lookup)
-    code: Optional[str] = None
 
 
 def extract_features(item: dict) -> FeatureSet:
     """
-    Convert a raw item dict to a FeatureSet.
+    Convert raw item dict to FeatureSet.
 
-    Expected input keys (all optional except 'name'):
-        name, strength, form, company, code, id
-
-    Example:
-        item = {
-            "name": "ADWIFLAM",
-            "strength": "75MG",
-            "form": "AMPOULE",
-            "company": "ADWIA",
-            "code": "270-00539"
-        }
+    Accepts these keys (all optional except 'name'):
+        name, strength, form, company, code, id, _row
     """
     fs = FeatureSet()
 
-    # --- ID / Code ---
-    fs.item_id = item.get("id") or item.get("item_id")
-    fs.code = _clean_code(item.get("code", ""))
+    # ID / code
+    fs.item_id = str(item.get("id") or item.get("item_id") or "")
+    fs.code    = _clean_code(str(item.get("code", "") or ""))
 
-    # --- Name ---
-    raw_name = str(item.get("name", "") or "").strip()
-    fs.raw_name = raw_name
-    fs.normalized_name = normalize_name(raw_name)
-    fs.name_tokens = tokenize_name(fs.normalized_name)
+    # Name — extract base name tokens only
+    raw_name     = str(item.get("name", "") or "").strip()
+    fs.raw_name  = raw_name
+    fs.base_name = extract_drug_base_name(raw_name)
+    fs.name_tokens = tokenize_drug_name(raw_name)
 
-    # --- Strength ---
+    # Strength — first try dedicated field, then parse from name
     raw_strength = str(item.get("strength", "") or "").strip()
+    if not raw_strength:
+        raw_strength = raw_name   # parse strength embedded in name
+
+    fs.strength_raw = raw_strength
     value, unit = parse_strength(raw_strength)
     fs.strength_value = value
-    fs.strength_unit = unit
+    fs.strength_unit  = unit
     if value is not None and unit is not None:
         fs.strength_base_value, fs.strength_base_unit = strength_to_base(value, unit)
 
-    # --- Form ---
-    raw_form = str(item.get("form", "") or "").strip()
-    fs.raw_form = raw_form
+    # Form — try dedicated field, then UOM, then parse from name
+    raw_form = str(item.get("form", "") or item.get("uom", "") or "").strip()
+    if not raw_form:
+        raw_form = raw_name   # normalize_form will pick it out
+    fs.raw_form      = raw_form
     fs.canonical_form = normalize_form(raw_form)
 
-    # --- Company ---
+    # Company
     raw_company = str(item.get("company", "") or "").strip()
-    fs.raw_company = raw_company
     if raw_company:
-        norm = normalize_name(raw_company)
-        fs.company_tokens = tokenize_name(norm)
+        fs.company_tokens = tokenize_drug_name(raw_company)
 
     return fs
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
 def _clean_code(code: str) -> str:
-    """Normalize item code: strip, uppercase, remove spaces."""
-    return re.sub(r"\s+", "", code.upper().strip()) if code else ""
-
-
-# Lazy import to avoid circular
-import re
+    import re
+    return re.sub(r"\s+", "", code.upper()) if code else ""
