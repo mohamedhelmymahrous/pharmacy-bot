@@ -1,16 +1,16 @@
 """
 bot.py
 ------
-Telegram bot — receives PDF, processes inventory, updates Excel + JSON.
+Telegram bot — receives Stock Card Report PDF,
+matches items against Excel inventory, updates Excel + JSON.
 """
 import os
 import logging
-import tempfile
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 from pdf_parser import extract_items_from_pdf
-from excel_manager import load_excel, sheet_to_db_list, update_excel, save_excel
+from excel_manager import load_excel, update_excel, save_excel
 from database import build_matcher, sync_from_excel
 
 logging.basicConfig(
@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", 10))
+MAX_FILE_MB    = int(os.environ.get("MAX_FILE_MB", 10))
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN missing from environment!")
@@ -35,15 +35,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # --- Text ping ---
+    # Text ping
     if msg.text:
         await msg.reply_text("✅ البوت شغال")
         return
 
-    # --- Document ---
     if not msg.document:
         return
 
+    # Validate file
     if not msg.document.file_name.lower().endswith(".pdf"):
         await msg.reply_text("❌ ابعت ملف PDF بس")
         return
@@ -52,7 +52,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ الملف أكبر من {MAX_FILE_MB}MB")
         return
 
-    # --- Download PDF ---
+    # Download
     await msg.reply_text("📥 جاري تحميل الملف...")
     try:
         file_obj = await context.bot.get_file(msg.document.file_id)
@@ -62,12 +62,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ فشل تحميل الملف")
         return
 
-    # --- Parse PDF ---
+    # Parse PDF
     await msg.reply_text("📄 جاري قراءة الملف...")
     try:
         items = extract_items_from_pdf(pdf_bytes)
     except Exception as e:
-        logger.error(f"PDF parse failed: {e}", exc_info=True)
+        logger.error(f"Parse failed: {e}", exc_info=True)
         await msg.reply_text("❌ فشل قراءة الملف — تأكد إنه Stock Card Report")
         return
 
@@ -75,30 +75,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ الملف فاضي — مش لاقي أصناف")
         return
 
-    # --- Load Excel + Build Matcher ---
+    # Load Excel + build matcher
     await msg.reply_text(f"🔄 جاري معالجة {len(items)} صنف...")
     try:
         wb, ws = load_excel()
-        matcher = build_matcher()
+        matcher, db_items = build_matcher()
     except Exception as e:
         logger.error(f"Setup failed: {e}", exc_info=True)
         await msg.reply_text("❌ خطأ في تحميل قاعدة البيانات")
         return
 
-    # --- Process Items ---
-    stats = {"exact": 0, "fuzzy": 0, "new": 0, "errors": 0}
+    # Build lookup: id → item with _row
+    row_lookup = {i["name"].upper(): i for i in db_items}
+
+    # Process items
+    stats = {"exact": 0, "fuzzy": 0, "new": 0, "errors": 0, "no_movement": 0}
     fuzzy_details = []
     new_details   = []
 
     for item in items:
+        # Skip items with no movement at all
+        received = float(item.get("received") or 0)
+        issued   = float(item.get("issued")   or 0)
+        if received == 0 and issued == 0:
+            stats["no_movement"] += 1
+            continue
+
         try:
             result = matcher.match(item)
             match_type = result.match_type
 
+            # Get matched_item with _row info
+            matched = None
+            if result.matched_item:
+                # Find the db_item that has _row
+                m_name = result.matched_item.get("name", "").upper()
+                matched = row_lookup.get(m_name)
+                if not matched:
+                    # fallback: search by name similarity
+                    for db_i in db_items:
+                        if db_i["name"].upper() == m_name:
+                            matched = db_i
+                            break
+
             update_excel(
                 item=item,
                 match_type=match_type,
-                matched_item_id=result.matched_item_id,
+                matched_item=matched,
                 ws=ws,
             )
 
@@ -107,33 +130,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if match_type == "fuzzy":
                 fuzzy_details.append(
                     f"  • {item.get('name','')} {item.get('strength','')}\n"
-                    f"    → {result.matched_item.get('name','')} "
+                    f"    → {result.matched_item.get('name','') if result.matched_item else '?'} "
                     f"({result.confidence_score:.0%})"
                 )
             elif match_type == "new":
                 new_details.append(
-                    f"  • {item.get('name','')} {item.get('strength','')} "
-                    f"{item.get('form','')}"
+                    f"  • {item.get('name','')} {item.get('form','')}"
                 )
 
         except Exception as e:
-            logger.error(f"Error processing item {item.get('name')}: {e}", exc_info=True)
+            logger.error(f"Error on {item.get('name')}: {e}", exc_info=True)
             stats["errors"] += 1
 
-    # --- Save Excel + Sync JSON ---
+    # Save Excel + sync JSON
     try:
         save_excel(wb)
         sync_from_excel()
     except Exception as e:
         logger.error(f"Save failed: {e}", exc_info=True)
-        await msg.reply_text("⚠️ تمت المعالجة لكن فشل الحفظ — حاول تاني")
+        await msg.reply_text("⚠️ تمت المعالجة لكن فشل الحفظ")
         return
 
-    # --- Build Summary ---
+    # Build summary
+    total_processed = stats["exact"] + stats["fuzzy"] + stats["new"]
     lines = [
-        f"✅ تمت المعالجة",
+        "✅ تمت المعالجة",
         f"📦 إجمالي الأصناف: {len(items)}",
-        f"",
+        f"   منها بدون حركة: {stats['no_movement']}",
+        f"   تمت معالجتها:   {total_processed}",
+        "",
         f"🟢 متطابق تماماً:  {stats['exact']}",
         f"🟡 متطابق جزئياً: {stats['fuzzy']}",
         f"🔴 أصناف جديدة:   {stats['new']}",
@@ -144,15 +169,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if fuzzy_details:
         lines.append(f"\n🟡 يحتاج مراجعة:")
-        lines.extend(fuzzy_details[:5])  # أول 5 بس
+        lines.extend(fuzzy_details[:5])
         if len(fuzzy_details) > 5:
-            lines.append(f"  ... و {len(fuzzy_details) - 5} أكتر")
+            lines.append(f"  ... و {len(fuzzy_details)-5} أكتر")
 
     if new_details:
         lines.append(f"\n🔴 أصناف جديدة أُضيفت:")
         lines.extend(new_details[:5])
         if len(new_details) > 5:
-            lines.append(f"  ... و {len(new_details) - 5} أكتر")
+            lines.append(f"  ... و {len(new_details)-5} أكتر")
 
     await msg.reply_text("\n".join(lines))
 
