@@ -19,7 +19,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.text:
         await msg.reply_text("bot shaghal ok")
 
-    elif msg.document:
+elif msg.document:
     file_obj = await context.bot.get_file(msg.document.file_id)
     pdf_bytes = bytes(await file_obj.download_as_bytearray())
 
@@ -45,7 +45,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await msg.reply_text(f"حصل خطأ: {str(e)}")
-
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, handle_message))
