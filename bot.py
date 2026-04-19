@@ -77,17 +77,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Load Excel + build matcher
     await msg.reply_text(f"🔄 جاري معالجة {len(items)} صنف...")
-    try:
-        wb, ws = load_excel()
-        matcher, db_items = build_matcher()
+try:
+    wb, ws = load_excel()
+    matcher, db_items = build_matcher()
 
-# 🔍 CHECK DATABASE FROM EXCEL
-print("🔵 DB SIZE:", len(db_items))
-print("🔵 SAMPLE ITEM:", db_items[0] if db_items else "EMPTY")
-    except Exception as e:
-        logger.error(f"Setup failed: {e}", exc_info=True)
-        await msg.reply_text("❌ خطأ في تحميل قاعدة البيانات")
-        return
+    # 🔍 CHECK DATABASE FROM EXCEL
+    print("🔵 DB SIZE:", len(db_items))
+    print("🔵 SAMPLE ITEM:", db_items[0] if db_items else "EMPTY")
+
+except Exception as e:
+    logger.error(f"Setup failed: {e}", exc_info=True)
+    await msg.reply_text("❌ خطأ في تحميل قاعدة البيانات")
+    return
 
     # Build lookup: id → item with _row
     row_lookup = {i["name"].upper(): i for i in db_items}
