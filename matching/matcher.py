@@ -2,19 +2,21 @@
 matcher.py — ERP-style pharmaceutical matching engine.
 
 Pipeline:
-  Step 1: Code shortcut (exact code = instant exact match)
-  Step 2: NAME filter (fuzzy, threshold 0.60)
-  Step 3: FORM filter (strict, skip if either missing)
-  Step 4: STRENGTH filter (strict, skip if either missing)
-  Step 5: Score + company bonus → classify exact/fuzzy/new
+  Step 1: Code shortcut
+  Step 2: NAME filter  (fuzzy, threshold 0.60)
+            normalization order: normalize_name → apply_alias → extract_base_name
+  Step 3: FORM filter  (strict — if pdf_form exists and nothing matches → NEW)
+  Step 4: STRENGTH filter (strict — one missing = reject)
+  Step 5: Company bonus → classify exact/fuzzy/new
 """
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
 from .normalizer import (
-    name_similarity, extract_base_name, strengths_match,
-    forms_match, normalize_form_str, parse_strength, jaccard,
+    normalize_name, name_similarity, extract_base_name,
+    strengths_match, forms_match, normalize_form_str,
+    parse_strength, jaccard,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,88 +59,122 @@ class PharmaMatcher:
         if not self._db:
             return MatchResult("new", 0.0, None, None, "Empty database")
 
-        pdf_name     = _alias(str(item.get("name","") or ""))
-        pdf_strength = str(item.get("strength","") or "") or pdf_name
-        pdf_form     = str(item.get("form","") or item.get("uom","") or "")
-        pdf_company  = str(item.get("company","") or "")
-        pdf_code     = str(item.get("code","") or "").strip()
+        # ── Normalize input (FIXED ORDER: normalize → alias → base) ────
+        raw_name     = str(item.get("name", "") or "")
+        pdf_name     = _normalize_then_alias(raw_name)
+        pdf_strength = str(item.get("strength", "") or "") or raw_name
+        pdf_form     = str(item.get("form", "") or item.get("uom", "") or "")
+        pdf_company  = str(item.get("company", "") or "")
+        pdf_code     = str(item.get("code", "") or "").strip()
         pdf_base     = extract_base_name(pdf_name)
+        pdf_form_n   = normalize_form_str(pdf_form)   # normalized once
 
         if debug:
             logger.debug(
                 f"\n{'─'*55}\n"
-                f"INPUT    : {item.get('name')}\n"
+                f"INPUT    : {raw_name}\n"
+                f"ALIAS    : {pdf_name}\n"
                 f"BASE     : {pdf_base}\n"
-                f"FORM_N   : {normalize_form_str(pdf_form)}\n"
+                f"FORM_N   : {pdf_form_n}\n"
                 f"STR_N    : {parse_strength(pdf_strength)}\n"
             )
 
         # Step 1 — Code shortcut
         if pdf_code:
             for db in self._db:
-                if str(db.get("code","") or "").strip() == pdf_code:
+                if str(db.get("code", "") or "").strip() == pdf_code:
                     if debug: logger.debug("  CODE MATCH")
-                    return MatchResult("exact",1.0,db.get("id"),db,
+                    return MatchResult("exact", 1.0, db.get("id"), db,
                                        f"Code match: {pdf_code}")
 
-        # Step 2 — Name filter
+        # Step 2 — Name filter (fuzzy, with proper normalization order)
         cands = []
         for db in self._db:
-            db_name = _alias(str(db.get("name","") or ""))
-            sim = name_similarity(pdf_name, db_name)
+            db_name_raw = str(db.get("name", "") or "")
+            db_name_n   = _normalize_then_alias(db_name_raw)   # same pipeline
+            sim = name_similarity(pdf_name, db_name_n)
             if sim >= NAME_THRESHOLD:
-                cands.append({"item":db,"sim":sim,"db_name":db_name,"notes":[]})
+                cands.append({
+                    "item":    db,
+                    "sim":     sim,
+                    "db_name": db_name_n,
+                    "notes":   [],
+                })
 
         if debug:
             logger.debug(f"  Step1 NAME : {len(cands)} cands (≥{NAME_THRESHOLD})")
-            for c in sorted(cands,key=lambda x:-x["sim"])[:5]:
+            for c in sorted(cands, key=lambda x: -x["sim"])[:5]:
                 logger.debug(f"    {c['sim']:.2f}  {c['db_name']}")
 
         if not cands:
-            _log_unk(item.get("name",""))
-            return MatchResult("new",0.0,None,None,
+            _log_unk(item)
+            return MatchResult("new", 0.0, None, None,
                                f"No name match ≥{NAME_THRESHOLD} for '{pdf_base}'")
 
-        # Step 3 — Form filter
-        form_ok = [c for c in cands
-                   if forms_match(pdf_form, str(c["item"].get("form","") or
-                                                c["item"].get("uom","") or ""))]
-        if debug:
-            logger.debug(f"  Step2 FORM : {len(form_ok)} survived "
-                         f"(pdf_form='{normalize_form_str(pdf_form)}')")
+        # Step 3 — Form filter (FIXED: strict when pdf_form exists)
+        if pdf_form_n:
+            form_ok = [
+                c for c in cands
+                if forms_match(
+                    pdf_form,
+                    str(c["item"].get("form", "") or c["item"].get("uom", "") or "")
+                )
+            ]
+            if debug:
+                logger.debug(
+                    f"  Step2 FORM : {len(form_ok)}/{len(cands)} survived "
+                    f"(pdf='{pdf_form_n}')"
+                )
+            if not form_ok:
+                # Form exists but NOTHING matched → NEW (no false match)
+                _log_unk(item)
+                return MatchResult(
+                    "new", 0.0, None, None,
+                    f"Form mismatch: pdf='{pdf_form_n}' matched no candidate"
+                )
+            working = form_ok
+        else:
+            # pdf_form unknown → can't filter, keep all
+            if debug:
+                logger.debug("  Step2 FORM : skipped (pdf form missing)")
+            working = cands
 
-        working = form_ok if form_ok else cands   # don't block on missing form
-
-        # Step 4 — Strength filter
+        # Step 4 — Strength filter (FIXED: one missing = reject)
         str_ok = []
         for c in working:
-            db_str = str(c["item"].get("strength","") or
-                         c["item"].get("name","") or "")
+            db_str = str(
+                c["item"].get("strength", "") or
+                c["item"].get("name", "") or ""
+            )
             if strengths_match(pdf_strength, db_str):
                 c["notes"].append(
                     f"str({parse_strength(pdf_strength)}"
-                    f"≈{parse_strength(db_str)})")
+                    f"≈{parse_strength(db_str)})"
+                )
                 str_ok.append(c)
             else:
                 if debug:
                     logger.debug(
                         f"  STR REJECT : '{c['db_name']}' "
                         f"pdf={parse_strength(pdf_strength)} "
-                        f"db={parse_strength(db_str)}")
+                        f"db={parse_strength(db_str)}"
+                    )
 
         if debug:
             logger.debug(f"  Step3 STR  : {len(str_ok)} survived")
 
         if not str_ok:
-            _log_unk(item.get("name",""))
-            return MatchResult("new",0.0,None,None,
-                               f"Strength mismatch eliminated all candidates. "
-                               f"PDF={parse_strength(pdf_strength)}")
+            _log_unk(item)
+            return MatchResult(
+                "new", 0.0, None, None,
+                f"Strength mismatch/asymmetry. "
+                f"PDF={parse_strength(pdf_strength)}"
+            )
 
         # Step 5 — Company bonus + pick best
         for c in str_ok:
-            score = c["sim"]
-            db_co = str(c["item"].get("company","") or "")
+            score  = c["sim"]
+            db_co  = str(c["item"].get("company", "") or "")
             if pdf_company and db_co and _co_match(pdf_company, db_co):
                 score = min(score + 0.05, 1.0)
                 c["notes"].append("company+")
@@ -148,9 +184,11 @@ class PharmaMatcher:
         best = str_ok[0]
 
         match_type = "exact" if best["sim"] >= EXACT_NAME_MIN else "fuzzy"
-        expl = (f"name_sim={best['sim']:.2f} "
-                f"'{pdf_base}'→'{extract_base_name(best['db_name'])}' "
-                + " ".join(best["notes"]))
+        expl = (
+            f"name_sim={best['sim']:.2f} "
+            f"'{pdf_base}'→'{extract_base_name(best['db_name'])}' "
+            + " ".join(best["notes"])
+        )
 
         if debug:
             logger.debug(
@@ -176,19 +214,27 @@ class PharmaMatcher:
 
 # ── helpers ──────────────────────────────────────────────────────────── #
 
-def _alias(name: str) -> str:
+def _normalize_then_alias(name: str) -> str:
+    """
+    Correct normalization order:
+    1. normalize_name()   — uppercase, clean punctuation
+    2. apply_alias()      — replace known aliases
+    3. result used for extract_base_name() downstream
+    """
+    normed = normalize_name(name)
     try:
         from dictionary_loader import apply_alias
-        return apply_alias(name)
+        return apply_alias(normed)
     except ImportError:
-        return name.upper().strip()
+        return normed
 
 
-def _log_unk(name: str):
+def _log_unk(item: dict):
+    name = str(item.get("name", "") or "")
     if not name: return
     try:
         from dictionary_loader import log_unknown
-        log_unknown(name)
+        log_unknown(item)
     except ImportError:
         pass
 
@@ -196,4 +242,4 @@ def _log_unk(name: str):
 def _co_match(a: str, b: str) -> bool:
     ta = {t for t in a.upper().split() if len(t) >= 3}
     tb = {t for t in b.upper().split() if len(t) >= 3}
-    return bool(ta and tb and jaccard(ta,tb) >= 0.5)
+    return bool(ta and tb and jaccard(ta, tb) >= 0.5)
