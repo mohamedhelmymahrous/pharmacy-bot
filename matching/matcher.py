@@ -1,38 +1,31 @@
 """
-matcher.py
-----------
-Core matching engine.
+matcher.py — ERP-style pharmaceutical matching engine.
 
-Thresholds:
-    >= 0.80 → exact
-    0.60–0.80 → fuzzy
-    < 0.60 → new
-
-MIN_NAME_SCORE lowered to 0.25 — name tokens are now clean so
-a single-token match gives Jaccard=1.0; the old 0.40 was
-cutting good matches because tokens included strength/form noise.
+Pipeline:
+  Step 1: Code shortcut (exact code = instant exact match)
+  Step 2: NAME filter (fuzzy, threshold 0.60)
+  Step 3: FORM filter (strict, skip if either missing)
+  Step 4: STRENGTH filter (strict, skip if either missing)
+  Step 5: Score + company bonus → classify exact/fuzzy/new
 """
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from .features import FeatureSet, extract_features
-from .scorer  import compute_score, score_name
+from .normalizer import (
+    name_similarity, extract_base_name, strengths_match,
+    forms_match, normalize_form_str, parse_strength, jaccard,
+)
 
-# ---------------------------------------------------------------------------
-# Thresholds
-# ---------------------------------------------------------------------------
-EXACT_THRESHOLD    = 0.75   # 0.78 = name exact + strength missing + form neutral → exact
-FUZZY_THRESHOLD    = 0.55
-MIN_NAME_SCORE     = 0.25   # fast-reject: skip candidates with near-zero name sim
+logger = logging.getLogger(__name__)
 
+NAME_THRESHOLD = 0.60
+EXACT_NAME_MIN = 0.95
 
-# ---------------------------------------------------------------------------
-# Result
-# ---------------------------------------------------------------------------
 
 @dataclass
 class MatchResult:
-    match_type:       str             # "exact" | "fuzzy" | "new"
+    match_type:       str
     confidence_score: float
     matched_item_id:  Optional[str]
     matched_item:     Optional[dict]
@@ -48,93 +41,159 @@ class MatchResult:
         }
 
 
-# ---------------------------------------------------------------------------
-# Matcher
-# ---------------------------------------------------------------------------
-
 class PharmaMatcher:
-    """
-    Pharmaceutical item matcher.
 
-    Usage:
-        matcher = PharmaMatcher(database)   # list of item dicts
-        result  = matcher.match(new_item)
-    """
+    def __init__(self, database: list):
+        self._db = list(database)
+        try:
+            from dictionary_loader import load_dictionary
+            load_dictionary()
+        except ImportError:
+            logger.warning("dictionary_loader not found — aliases disabled")
 
-    def __init__(self, database: list[dict]):
-        """Pre-compute FeatureSets for entire database at init time."""
-        self._db: list[tuple[dict, FeatureSet]] = []
-        for item in database:
-            fs = extract_features(item)
-            self._db.append((item, fs))
+    # ------------------------------------------------------------------ #
 
-    # ------------------------------------------------------------------
-
-    def match(self, new_item: dict, debug: bool = False) -> MatchResult:
-        """
-        Match new_item against database.
-
-        Parameters
-        ----------
-        new_item : dict with keys: name, strength, form, company, code
-        debug    : if True, print top-5 candidates to stdout
-        """
+    def match(self, item: dict, debug: bool = False) -> MatchResult:
         if not self._db:
             return MatchResult("new", 0.0, None, None, "Empty database")
 
-        new_fs = extract_features(new_item)
-
-        candidates: list[tuple[float, dict, dict]] = []  # (score, result, item)
-
-        for db_item, db_fs in self._db:
-            # Fast reject: name must have minimum similarity
-            n_score, _ = score_name(new_fs, db_fs)
-            if n_score < MIN_NAME_SCORE:
-                continue
-
-            result = compute_score(new_fs, db_fs)
-            candidates.append((result["total"], result, db_item))
-
-        if not candidates:
-            return MatchResult(
-                "new", 0.0, None, None,
-                f"No candidate passed name threshold ({MIN_NAME_SCORE}) "
-                f"for '{new_fs.base_name}'"
-            )
-
-        # Sort by score descending
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        pdf_name     = _alias(str(item.get("name","") or ""))
+        pdf_strength = str(item.get("strength","") or "") or pdf_name
+        pdf_form     = str(item.get("form","") or item.get("uom","") or "")
+        pdf_company  = str(item.get("company","") or "")
+        pdf_code     = str(item.get("code","") or "").strip()
+        pdf_base     = extract_base_name(pdf_name)
 
         if debug:
-            print(f"\n[MATCH] '{new_item.get('name')}' → base='{new_fs.base_name}' "
-                  f"tokens={new_fs.name_tokens}")
-            for sc, res, itm in candidates[:5]:
-                print(f"  {sc:.3f}  {itm.get('name','?'):30s}  {res['explanation'][:80]}")
+            logger.debug(
+                f"\n{'─'*55}\n"
+                f"INPUT    : {item.get('name')}\n"
+                f"BASE     : {pdf_base}\n"
+                f"FORM_N   : {normalize_form_str(pdf_form)}\n"
+                f"STR_N    : {parse_strength(pdf_strength)}\n"
+            )
 
-        best_score, best_result, best_item = candidates[0]
+        # Step 1 — Code shortcut
+        if pdf_code:
+            for db in self._db:
+                if str(db.get("code","") or "").strip() == pdf_code:
+                    if debug: logger.debug("  CODE MATCH")
+                    return MatchResult("exact",1.0,db.get("id"),db,
+                                       f"Code match: {pdf_code}")
 
-        # Decide
-        if best_score >= EXACT_THRESHOLD:
-            match_type = "exact"
-        elif best_score >= FUZZY_THRESHOLD:
-            match_type = "fuzzy"
-        else:
-            match_type = "new"
-            best_item  = None
+        # Step 2 — Name filter
+        cands = []
+        for db in self._db:
+            db_name = _alias(str(db.get("name","") or ""))
+            sim = name_similarity(pdf_name, db_name)
+            if sim >= NAME_THRESHOLD:
+                cands.append({"item":db,"sim":sim,"db_name":db_name,"notes":[]})
+
+        if debug:
+            logger.debug(f"  Step1 NAME : {len(cands)} cands (≥{NAME_THRESHOLD})")
+            for c in sorted(cands,key=lambda x:-x["sim"])[:5]:
+                logger.debug(f"    {c['sim']:.2f}  {c['db_name']}")
+
+        if not cands:
+            _log_unk(item.get("name",""))
+            return MatchResult("new",0.0,None,None,
+                               f"No name match ≥{NAME_THRESHOLD} for '{pdf_base}'")
+
+        # Step 3 — Form filter
+        form_ok = [c for c in cands
+                   if forms_match(pdf_form, str(c["item"].get("form","") or
+                                                c["item"].get("uom","") or ""))]
+        if debug:
+            logger.debug(f"  Step2 FORM : {len(form_ok)} survived "
+                         f"(pdf_form='{normalize_form_str(pdf_form)}')")
+
+        working = form_ok if form_ok else cands   # don't block on missing form
+
+        # Step 4 — Strength filter
+        str_ok = []
+        for c in working:
+            db_str = str(c["item"].get("strength","") or
+                         c["item"].get("name","") or "")
+            if strengths_match(pdf_strength, db_str):
+                c["notes"].append(
+                    f"str({parse_strength(pdf_strength)}"
+                    f"≈{parse_strength(db_str)})")
+                str_ok.append(c)
+            else:
+                if debug:
+                    logger.debug(
+                        f"  STR REJECT : '{c['db_name']}' "
+                        f"pdf={parse_strength(pdf_strength)} "
+                        f"db={parse_strength(db_str)}")
+
+        if debug:
+            logger.debug(f"  Step3 STR  : {len(str_ok)} survived")
+
+        if not str_ok:
+            _log_unk(item.get("name",""))
+            return MatchResult("new",0.0,None,None,
+                               f"Strength mismatch eliminated all candidates. "
+                               f"PDF={parse_strength(pdf_strength)}")
+
+        # Step 5 — Company bonus + pick best
+        for c in str_ok:
+            score = c["sim"]
+            db_co = str(c["item"].get("company","") or "")
+            if pdf_company and db_co and _co_match(pdf_company, db_co):
+                score = min(score + 0.05, 1.0)
+                c["notes"].append("company+")
+            c["score"] = score
+
+        str_ok.sort(key=lambda x: -x["score"])
+        best = str_ok[0]
+
+        match_type = "exact" if best["sim"] >= EXACT_NAME_MIN else "fuzzy"
+        expl = (f"name_sim={best['sim']:.2f} "
+                f"'{pdf_base}'→'{extract_base_name(best['db_name'])}' "
+                + " ".join(best["notes"]))
+
+        if debug:
+            logger.debug(
+                f"  RESULT   : {match_type.upper()} score={best['score']:.2f}\n"
+                f"  MATCHED  : {best['item'].get('name')}\n"
+                f"  REASON   : {expl}\n"
+            )
 
         return MatchResult(
             match_type       = match_type,
-            confidence_score = round(best_score, 4),
-            matched_item_id  = best_item.get("id") if best_item else None,
-            matched_item     = best_item,
-            explanation      = best_result["explanation"],
+            confidence_score = round(best["score"], 4),
+            matched_item_id  = best["item"].get("id"),
+            matched_item     = best["item"],
+            explanation      = expl,
         )
 
-    # ------------------------------------------------------------------
+    def match_batch(self, items: list, debug: bool = False) -> list:
+        return [self.match(i, debug=debug) for i in items]
 
-    def match_batch(self, items: list[dict], debug: bool = False) -> list[MatchResult]:
-        return [self.match(item, debug=debug) for item in items]
+    def add_to_database(self, item: dict):
+        self._db.append(item)
 
-    def add_to_database(self, new_item: dict):
-        """Add confirmed new item to in-memory database."""
-        self._db.append((new_item, extract_features(new_item)))
+
+# ── helpers ──────────────────────────────────────────────────────────── #
+
+def _alias(name: str) -> str:
+    try:
+        from dictionary_loader import apply_alias
+        return apply_alias(name)
+    except ImportError:
+        return name.upper().strip()
+
+
+def _log_unk(name: str):
+    if not name: return
+    try:
+        from dictionary_loader import log_unknown
+        log_unknown(name)
+    except ImportError:
+        pass
+
+
+def _co_match(a: str, b: str) -> bool:
+    ta = {t for t in a.upper().split() if len(t) >= 3}
+    tb = {t for t in b.upper().split() if len(t) >= 3}
+    return bool(ta and tb and jaccard(ta,tb) >= 0.5)
