@@ -1,7 +1,5 @@
 """
-normalizer.py
--------------
-Pharmaceutical text normalization layer.
+normalizer.py — Pharmaceutical text normalization layer.
 """
 import re
 from typing import Optional
@@ -39,10 +37,10 @@ _UNIT_TO_ML   = {"ML":1.0,"L":1000.0}
 def normalize_name(raw: str) -> str:
     if not raw: return ""
     s = raw.upper().strip()
-    s = re.sub(r"[()]"," ",s)
-    s = re.sub(r"(?<=[A-Z])-(?=[A-Z])"," ",s)
-    s = re.sub(r"[^\w\s/.]"," ",s)
-    return re.sub(r"\s+"," ",s).strip()
+    s = re.sub(r"[()]", " ", s)
+    s = re.sub(r"(?<=[A-Z])-(?=[A-Z])", " ", s)
+    s = re.sub(r"[^\w\s/.]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def extract_base_name(raw: str) -> str:
@@ -53,14 +51,14 @@ def extract_base_name(raw: str) -> str:
         if re.match(r"^\d+$", word): continue
         if STRENGTH_RE.match(word): continue
         if re.match(r"^\d+[./]\d+", word): continue
-        clean = re.sub(r"\d+$","",word)
-        alpha = re.sub(r"[^A-Z]","",clean)
+        clean = re.sub(r"\d+$", "", word)
+        alpha = re.sub(r"[^A-Z]", "", clean)
         if alpha in _FORM_WORDS: continue
         if alpha in _NOISE_WORDS: continue
         if alpha in {"MG","MCG","ML","IU","GM","UG","G","L","SR"}: continue
         if len(alpha) >= 2: out.append(alpha)
     if not out and s:
-        out = [re.sub(r"[^A-Z]","",s.split()[0])]
+        out = [re.sub(r"[^A-Z]", "", s.split()[0])]
     return " ".join(out)
 
 
@@ -72,29 +70,53 @@ def parse_strength(s: str) -> tuple:
     if not s: return None, None
     m = STRENGTH_RE.search(str(s).upper())
     if not m: return None, None
-    val = m.group(1).replace(",",".").split("/")[0]
-    unit = m.group(2).upper().replace(".","").split("/")[0]
-    unit = re.sub(r"UNITS?$","UNIT",unit)
+    val  = m.group(1).replace(",", ".").split("/")[0]
+    unit = m.group(2).upper().replace(".", "").split("/")[0]
+    unit = re.sub(r"UNITS?$", "UNIT", unit)
     try: return float(val), unit
     except ValueError: return None, None
 
 
 def to_base_strength(value: float, unit: str) -> tuple:
-    if unit in _WEIGHT_UNITS: return value * _UNIT_TO_MG.get(unit,1.0), "MG"
-    if unit in _VOLUME_UNITS: return value * _UNIT_TO_ML.get(unit,1.0), "ML"
+    if unit in _WEIGHT_UNITS: return value * _UNIT_TO_MG.get(unit, 1.0), "MG"
+    if unit in _VOLUME_UNITS: return value * _UNIT_TO_ML.get(unit, 1.0), "ML"
     return value, unit
 
 
+# ── FIXED: strengths_match ────────────────────────────────────────────────
 def strengths_match(a: str, b: str, tolerance: float = 0.02) -> bool:
+    """
+    Strict strength comparison.
+
+    Rules:
+    - BOTH missing  → allow match (True)   — no strength data on either side
+    - ONE missing   → reject match (False) — asymmetric data = unsafe
+    - BOTH present  → compare numerically within tolerance
+    - Different dim → reject (MG vs ML)
+    """
     va, ua = parse_strength(a)
     vb, ub = parse_strength(b)
-    if va is None or vb is None: return True
+
+    # Both missing → allow (no strength info available)
+    if va is None and vb is None:
+        return True
+
+    # One missing → REJECT (was: return True — this was the bug)
+    if va is None or vb is None:
+        return False
+
+    # Normalize to base units
     va, ua = to_base_strength(va, ua)
     vb, ub = to_base_strength(vb, ub)
-    if ua != ub: return False
+
+    # Different dimensions → reject
+    if ua != ub:
+        return False
+
     if va == 0 and vb == 0: return True
-    if va == 0 or vb == 0: return False
-    return min(va,vb)/max(va,vb) >= (1.0 - tolerance)
+    if va == 0 or vb == 0:  return False
+
+    return min(va, vb) / max(va, vb) >= (1.0 - tolerance)
 
 
 def normalize_form_str(raw: str) -> str:
@@ -115,24 +137,23 @@ def forms_match(a: str, b: str) -> bool:
 
 def jaccard(a: set, b: set) -> float:
     if not a and not b: return 1.0
-    if not a or not b: return 0.0
+    if not a or not b:  return 0.0
     i = len(a & b); u = len(a | b)
-    return i/u if u else 0.0
+    return i / u if u else 0.0
 
 
 def char_similarity(s1: str, s2: str) -> float:
     if s1 == s2: return 1.0
     if not s1 or not s2: return 0.0
-    a = s1.replace(" ","")[:60]
-    b = s2.replace(" ","")[:60]
-    n = len(b); prev = [0]*(n+1)
+    a = s1.replace(" ", "")[:60]
+    b = s2.replace(" ", "")[:60]
+    n = len(b); prev = [0] * (n + 1)
     for ca in a:
-        curr = [0]*(n+1)
-        for j,cb in enumerate(b):
-            curr[j+1] = prev[j]+1 if ca==cb else max(curr[j],prev[j+1])
+        curr = [0] * (n + 1)
+        for j, cb in enumerate(b):
+            curr[j+1] = prev[j]+1 if ca == cb else max(curr[j], prev[j+1])
         prev = curr
-    lcs = prev[n]
-    return 2*lcs/(len(a)+len(b))
+    return 2 * prev[n] / (len(a) + len(b))
 
 
 def name_similarity(raw_a: str, raw_b: str) -> float:
@@ -140,8 +161,8 @@ def name_similarity(raw_a: str, raw_b: str) -> float:
     bb = extract_base_name(raw_b)
     if not ba or not bb: return 0.0
     if ba == bb: return 1.0
-    j  = jaccard(set(ba.split()), set(bb.split()))
-    cs = char_similarity(ba, bb)
-    short = min(ba,bb,key=len); long_ = max(ba,bb,key=len)
-    prefix = 0.10 if len(short)>=4 and long_.startswith(short) else 0.0
-    return min(max(j,cs)+prefix, 1.0)
+    j   = jaccard(set(ba.split()), set(bb.split()))
+    cs  = char_similarity(ba, bb)
+    short = min(ba, bb, key=len); long_ = max(ba, bb, key=len)
+    prefix = 0.10 if len(short) >= 4 and long_.startswith(short) else 0.0
+    return min(max(j, cs) + prefix, 1.0)
