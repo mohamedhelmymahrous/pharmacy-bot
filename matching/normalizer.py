@@ -1,227 +1,147 @@
 """
 normalizer.py
 -------------
-Pharmaceutical text normalization.
-Root cause fix: name tokens must be separated from strength/form tokens
-before any similarity comparison.
+Pharmaceutical text normalization layer.
 """
 import re
+from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Form synonym → canonical
-# ---------------------------------------------------------------------------
-FORM_MAP = {
-    "TAB": "TABLET", "TABS": "TABLET", "TABLETS": "TABLET",
-    "FILM": "TABLET", "COATED": "TABLET", "FC": "TABLET",
-    "FILMCOATED": "TABLET", "FILMCOAT": "TABLET",
-    "DISPERSIBLE": "TABLET", "EFFERVESCENT": "TABLET",
-    "CAP": "CAPSULE", "CAPS": "CAPSULE", "CAPSULES": "CAPSULE",
-    "SOFTGEL": "CAPSULE", "SOFTCAP": "CAPSULE",
-    "AMP": "AMPOULE", "AMPS": "AMPOULE", "AMPOULES": "AMPOULE",
-    "INJECTION": "AMPOULE", "INJ": "AMPOULE", "AMPL": "AMPOULE",
-    "VIAL": "VIAL", "VIALS": "VIAL",
-    "SYR": "SYRUP", "SYRUP": "SYRUP",
-    "SUSP": "SUSPENSION", "SUSPENSION": "SUSPENSION",
-    "DROPS": "DROPS", "DROP": "DROPS", "ORAL": "DROPS",
-    "SOL": "SOLUTION", "SOLUTION": "SOLUTION",
-    "INF": "INFUSION", "INFUSION": "INFUSION",
-    "OINT": "OINTMENT", "OINTMENT": "OINTMENT",
-    "CR": "CREAM", "CREAM": "CREAM",
-    "GEL": "GEL",
-    "MDI": "INHALER", "INHALER": "INHALER",
-    "SPRAY": "SPRAY",
-    "SACHET": "SACHET", "SACH": "SACHET",
-    "PEN": "PEN", "FLEXPEN": "PEN", "PENFIL": "PEN",
-    "CARTRIDGE": "CARTRIDGE",
-    "BOTTLE": "BOTTLE",
-    "LOZENGE": "LOZENGE",
-    "PATCH": "PATCH",
-    "SUPPOSITORY": "SUPPOSITORY", "SUPP": "SUPPOSITORY",
-    "LOTION": "LOTION",
-    "STRIP": "TABLET",   # strip = tablet packaging
-}
-
-# All form-related words to STRIP from name tokens
-FORM_WORDS = set(FORM_MAP.keys()) | set(FORM_MAP.values())
-FORM_WORDS.update({
-    "FILM", "COATED", "ORAL", "SUSTAINED", "RELEASE",
-    "MODIFIED", "EXTENDED", "PROLONGED", "RETARD",
-    "CHEWABLE", "CHEW", "EFFERVESCENT", "ENTERIC",
-    "IMMEDIATE", "DELAYED", "CONTROLLED",
-    "SCORED", "UNSCORED", "PLAIN",
-    "INTRAVENOUS", "IV", "IM", "SC", "SUBCUTANEOUS",
-    "INTRAMUSCULAR", "TOPICAL", "TRANSDERMAL",
-    "ML", "MG", "MCG", "GM", "IU", "UG",
-    "STRIP", "BOX", "PACK", "SACHET",
-})
-
-# Noise words — carry no drug identity
-NOISE_WORDS = {
-    "AND", "FOR", "WITH", "PLUS", "EXTRA",
-    "FORTE", "JUNIOR", "PEDIATRIC", "PAEDIATRIC", "ADULT",
-    "SR", "XR", "ER", "LA", "MR", "CR", "PR",
-    "COMPOUND", "COMP", "COMPLEX",
-    "NEW", "ORIGINAL", "GENERIC",
-}
-
-# Strength pattern
 STRENGTH_RE = re.compile(
     r"(\d+(?:[.,]\d+)?(?:/\d+(?:[.,]\d+)?)?)\s*"
     r"(MG|MCG|UG|G(?!\w)|GM|ML(?:/\w+)?|L(?!\w)|IU|I\.U\.|UNIT(?:S)?|%)",
     re.IGNORECASE,
 )
 
-# Unit normalization to base
-WEIGHT_UNITS = {"G", "GM", "GRAM", "MG", "MCG", "UG"}
-VOLUME_UNITS = {"ML", "L"}
-INCOMPARABLE_UNITS = {"%", "IU", "UNIT", "UNITS"}
-
-UNIT_TO_BASE = {
-    "G": 1000.0, "GM": 1000.0, "GRAM": 1000.0,
-    "MG": 1.0,
-    "MCG": 0.001, "UG": 0.001,
-    "ML": 1.0, "L": 1000.0,
-    "IU": 1.0, "%": 1.0, "UNIT": 1.0, "UNITS": 1.0,
+_FORM_WORDS = {
+    "TABLET","TABLETS","TAB","TABS","CAPSULE","CAPSULES","CAP","CAPS",
+    "AMPOULE","AMPOULES","AMP","AMPS","INJECTION","INJ",
+    "SYRUP","SYR","SUSPENSION","SUSP","SOLUTION","SOL",
+    "DROPS","DROP","INFUSION","INF","OINTMENT","OINT","GEL","CREAM","LOTION",
+    "INHALER","SPRAY","SACHET","SACH","VIAL","VIALS","PEN","FLEXPEN","PENFIL",
+    "CARTRIDGE","BOTTLE","SUPPOSITORY","SUPP","PATCH","LOZENGE",
+    "FILM","COATED","FILMCOATED","FC","DISPERSIBLE","EFFERVESCENT","CHEWABLE",
+    "STRIP","ORAL","SUSTAINED","RELEASE","MODIFIED","EXTENDED","DELAYED",
+    "CONTROLLED","ENTERIC","INTRAVENOUS","IV","IM","SC","TOPICAL",
 }
 
+_NOISE_WORDS = {
+    "AND","FOR","WITH","PLUS","EXTRA","FORTE","JUNIOR","PEDIATRIC","PAEDIATRIC",
+    "ADULT","SR","XR","ER","LA","MR","CR","PR","COMPOUND","COMP","COMPLEX",
+    "NEW","GENERIC",
+}
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def extract_drug_base_name(raw_name: str) -> str:
-    """
-    Extract ONLY the brand/drug name tokens from a full pharmaceutical string.
-    Removes: strength values, units, dosage forms, noise words, numbers.
-
-    Examples:
-        'ADWIFLAM 75mg Ampoule 3 ml'  -> 'ADWIFLAM'
-        'ALDOMET 250MG FILM COATED'   -> 'ALDOMET'
-        'ALKAPRESS 5 mg Strip 10'     -> 'ALKAPRESS'
-        'AMLODIPINE 10MG TABLET'      -> 'AMLODIPINE'
-        'ALKAPRESS TRIO (5/12.5/160)' -> 'ALKAPRESS TRIO'
-        'adwiflam'                    -> 'ADWIFLAM'
-        'ALDOMET(METHYLDOPA)'         -> 'ALDOMET METHYLDOPA'
-    """
-    if not raw_name:
-        return ""
-
-    text = raw_name.upper().strip()
-
-    # Normalize brackets and hyphens
-    text = re.sub(r"[()]", " ", text)
-    text = re.sub(r"(?<=[A-Z])-(?=[A-Z])", " ", text)  # ADWI-FLAM → ADWI FLAM
-    text = re.sub(r"[^\w\s/]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    words = text.split()
-    name_tokens = []
-
-    for word in words:
-        # Stop at pure numbers
-        if re.match(r"^\d+$", word):
-            continue
-
-        # Stop at strength pattern embedded in word (75MG → stop)
-        if STRENGTH_RE.match(word):
-            continue
-
-        # Check if it's a slash-strength (1.5/5ML)
-        if re.match(r"^\d+[./]\d+", word):
-            continue
-
-        # Strip trailing digits from word (AMARYL1 → AMARYL)
-        clean = re.sub(r"\d+$", "", word)
-        alpha = re.sub(r"[^A-Z]", "", clean)
-
-        # Skip form words
-        if alpha in FORM_WORDS or word in FORM_WORDS:
-            continue
-
-        # Skip noise words
-        if alpha in NOISE_WORDS:
-            continue
-
-        # Skip pure unit words
-        if alpha in {"MG", "MCG", "ML", "IU", "GM", "UG", "G", "L"}:
-            continue
-
-        # Keep if has alphabetic content (min 2 chars)
-        if len(alpha) >= 2:
-            name_tokens.append(alpha)
-
-    # Fallback: if nothing survived, use first word
-    if not name_tokens and words:
-        name_tokens = [re.sub(r"[^A-Z]", "", words[0].upper())]
-
-    return " ".join(name_tokens)
+_WEIGHT_UNITS = {"G","GM","GRAM","MG","MCG","UG"}
+_VOLUME_UNITS = {"ML","L"}
+_UNIT_TO_MG   = {"G":1000.0,"GM":1000.0,"GRAM":1000.0,"MG":1.0,"MCG":0.001,"UG":0.001}
+_UNIT_TO_ML   = {"ML":1.0,"L":1000.0}
 
 
-def tokenize_drug_name(raw_name: str) -> set[str]:
-    """
-    Returns a set of clean drug name tokens (no strength/form/noise).
-    Used for Jaccard similarity.
-    """
-    base = extract_drug_base_name(raw_name)
-    tokens = set(base.split())
-    return {t for t in tokens if len(t) >= 2}
+def normalize_name(raw: str) -> str:
+    if not raw: return ""
+    s = raw.upper().strip()
+    s = re.sub(r"[()]"," ",s)
+    s = re.sub(r"(?<=[A-Z])-(?=[A-Z])"," ",s)
+    s = re.sub(r"[^\w\s/.]"," ",s)
+    return re.sub(r"\s+"," ",s).strip()
 
 
-def normalize_form(form: str) -> str:
-    """Map any dosage form variant to its canonical form."""
-    if not form:
-        return ""
-    upper = form.upper().strip()
-    if upper in FORM_MAP:
-        return FORM_MAP[upper]
-    # Try longest-match in the string
-    for key in sorted(FORM_MAP.keys(), key=len, reverse=True):
-        if key in upper:
-            return FORM_MAP[key]
-    return upper
+def extract_base_name(raw: str) -> str:
+    if not raw: return ""
+    s = normalize_name(raw)
+    out = []
+    for word in s.split():
+        if re.match(r"^\d+$", word): continue
+        if STRENGTH_RE.match(word): continue
+        if re.match(r"^\d+[./]\d+", word): continue
+        clean = re.sub(r"\d+$","",word)
+        alpha = re.sub(r"[^A-Z]","",clean)
+        if alpha in _FORM_WORDS: continue
+        if alpha in _NOISE_WORDS: continue
+        if alpha in {"MG","MCG","ML","IU","GM","UG","G","L","SR"}: continue
+        if len(alpha) >= 2: out.append(alpha)
+    if not out and s:
+        out = [re.sub(r"[^A-Z]","",s.split()[0])]
+    return " ".join(out)
 
 
-def parse_strength(strength_str: str) -> tuple[float | None, str | None]:
-    """
-    Parse strength string → (numeric_value, unit).
-
-    Examples:
-        '75MG'        → (75.0,  'MG')
-        '1.5MG/5ML'   → (1.5,   'MG')
-        '5 mg'        → (5.0,   'MG')
-        '0.5MCG'      → (0.5,   'MCG')
-        None          → (None,  None)
-    """
-    if not strength_str:
-        return None, None
-    upper = str(strength_str).upper().strip()
-    m = STRENGTH_RE.search(upper)
-    if not m:
-        return None, None
-    raw_val = m.group(1).replace(",", ".").split("/")[0]  # take numerator
-    raw_unit = m.group(2).upper().replace(".", "")
-    if raw_unit in ("IU",):
-        raw_unit = "IU"
-    raw_unit = re.sub(r"/.*$", "", raw_unit)   # ML/5ML → ML
-    try:
-        return float(raw_val), raw_unit
-    except ValueError:
-        return None, None
+def name_tokens(raw: str) -> set:
+    return {t for t in extract_base_name(raw).split() if len(t) >= 2}
 
 
-def strength_to_base(value: float, unit: str) -> tuple[float, str]:
-    """Convert strength to base unit within its dimension."""
-    if unit in INCOMPARABLE_UNITS:
-        return value, unit
-    if unit in WEIGHT_UNITS:
-        return value * UNIT_TO_BASE.get(unit, 1.0), "MG"
-    if unit in VOLUME_UNITS:
-        return value * UNIT_TO_BASE.get(unit, 1.0), "ML"
+def parse_strength(s: str) -> tuple:
+    if not s: return None, None
+    m = STRENGTH_RE.search(str(s).upper())
+    if not m: return None, None
+    val = m.group(1).replace(",",".").split("/")[0]
+    unit = m.group(2).upper().replace(".","").split("/")[0]
+    unit = re.sub(r"UNITS?$","UNIT",unit)
+    try: return float(val), unit
+    except ValueError: return None, None
+
+
+def to_base_strength(value: float, unit: str) -> tuple:
+    if unit in _WEIGHT_UNITS: return value * _UNIT_TO_MG.get(unit,1.0), "MG"
+    if unit in _VOLUME_UNITS: return value * _UNIT_TO_ML.get(unit,1.0), "ML"
     return value, unit
 
 
-def clean_text(text: str) -> str:
-    """Generic text cleaner — uppercase, collapse spaces."""
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text.upper().strip())
+def strengths_match(a: str, b: str, tolerance: float = 0.02) -> bool:
+    va, ua = parse_strength(a)
+    vb, ub = parse_strength(b)
+    if va is None or vb is None: return True
+    va, ua = to_base_strength(va, ua)
+    vb, ub = to_base_strength(vb, ub)
+    if ua != ub: return False
+    if va == 0 and vb == 0: return True
+    if va == 0 or vb == 0: return False
+    return min(va,vb)/max(va,vb) >= (1.0 - tolerance)
+
+
+def normalize_form_str(raw: str) -> str:
+    if not raw: return ""
+    try:
+        from dictionary_loader import apply_form_map
+        return apply_form_map(raw)
+    except ImportError:
+        return raw.upper().strip()
+
+
+def forms_match(a: str, b: str) -> bool:
+    na = normalize_form_str(a)
+    nb = normalize_form_str(b)
+    if not na or not nb: return True
+    return na == nb
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a and not b: return 1.0
+    if not a or not b: return 0.0
+    i = len(a & b); u = len(a | b)
+    return i/u if u else 0.0
+
+
+def char_similarity(s1: str, s2: str) -> float:
+    if s1 == s2: return 1.0
+    if not s1 or not s2: return 0.0
+    a = s1.replace(" ","")[:60]
+    b = s2.replace(" ","")[:60]
+    n = len(b); prev = [0]*(n+1)
+    for ca in a:
+        curr = [0]*(n+1)
+        for j,cb in enumerate(b):
+            curr[j+1] = prev[j]+1 if ca==cb else max(curr[j],prev[j+1])
+        prev = curr
+    lcs = prev[n]
+    return 2*lcs/(len(a)+len(b))
+
+
+def name_similarity(raw_a: str, raw_b: str) -> float:
+    ba = extract_base_name(raw_a)
+    bb = extract_base_name(raw_b)
+    if not ba or not bb: return 0.0
+    if ba == bb: return 1.0
+    j  = jaccard(set(ba.split()), set(bb.split()))
+    cs = char_similarity(ba, bb)
+    short = min(ba,bb,key=len); long_ = max(ba,bb,key=len)
+    prefix = 0.10 if len(short)>=4 and long_.startswith(short) else 0.0
+    return min(max(j,cs)+prefix, 1.0)
